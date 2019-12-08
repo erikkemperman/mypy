@@ -6,8 +6,8 @@ import os
 import re
 import sys
 
-import toml  # type: ignore
-from typing import Any, Dict, List, Mapping, Optional, Tuple, TextIO
+import toml
+from typing import Any, Dict, List, Mapping, Optional, Tuple, TextIO, MutableMapping
 from typing_extensions import Final
 
 from mypy import defaults
@@ -107,7 +107,7 @@ toml_type_conversors = {
     'files': match_files,
     'cache_dir': expand_path,
     'python_executable': expand_path,
-}
+} # type: Final
 
 
 def parse_config_file(options: Options, filename: Optional[str],
@@ -119,38 +119,48 @@ def parse_config_file(options: Options, filename: Optional[str],
 
     If filename is None, fall back to default config files.
     """
-    if filename is None or os.path.splitext(filename)[1] == '.toml':
-        parse_toml_config_file(options, filename, stderr)
+    if filename:
+        filename = os.path.expanduser(filename)
+        if os.path.splitext(filename)[1] == '.toml':
+            parse_toml_config_file(options, filename, stdout, stderr)
+        else:
+            parse_ini_config_file(options, filename, stdout, stderr)
     else:
-        parse_ini_config_file(options, filename, stdout, stderr)
+        for filename in defaults.CONFIG_FILES:
+            filename = os.path.expanduser(filename)
+            if not os.path.isfile(filename):
+                continue
+            if os.path.splitext(filename)[1] == '.toml':
+                parsed = parse_toml_config_file(options, filename, stdout, stderr)
+            else:
+                parsed = parse_ini_config_file(options, filename, stdout, stderr)
+            if parsed:
+                break
 
 
 def parse_toml_config_file(options: Options, filename: Optional[str],
                            stdout: Optional[TextIO] = None,
-                           stderr: Optional[TextIO] = None) -> None:
+                           stderr: Optional[TextIO] = None) -> bool:
     stderr = stderr or sys.stderr
 
-    # Load the toml config file,
-    config_file = filename or defaults.TOML_CONFIG_FILE
-    if not os.path.exists(config_file):
-        return
+    # Load the toml config file.
     try:
-        table = toml.load(config_file)  # type: Dict[str, Any]
+        table = toml.load(filename)  # type: MutableMapping[str, Any]
     except (TypeError, toml.TomlDecodeError, IOError) as err:
-        print("%s: %s" % (config_file, err), file=stderr)
-        return
+        print("%s: %s" % (filename, err), file=stderr)
+        return False
     else:
-        options.config_file = config_file
+        options.config_file = filename
 
     if 'mypy' not in table:
-        print("%s: No [mypy] table in config file" % config_file, file=stderr)
-        return
+        print("%s: No [mypy] table in config file" % filename, file=stderr)
+        return False
 
     # Handle the mypy table.
     for key, value in table['mypy'].items():
 
         # Is an option.
-        if not isinstance(value, dict):
+        if key != 'overrides':
 
             # Is a report directory.
             if key.endswith('_report'):
@@ -159,82 +169,73 @@ def parse_toml_config_file(options: Options, filename: Optional[str],
                     options.report_dirs[report_type] = table['mypy'][key]
                 else:
                     print("%s: Unrecognized report type: %s" %
-                          (config_file, key),
+                          (filename, key),
                           file=stderr)
             else:
                 if key in toml_type_conversors:
                     value = toml_type_conversors[key](value)
                 setattr(options, key, value)
 
-        # Is a subtable. Should be a package/module glob.
+        # Read the per-module override sub-tables.
         else:
-            glob = key
-            if (any(c in glob for c in '?[]!') or
-                    any('*' in x and x != '*' for x in glob.split('.'))):
-                print("%s: Patterns must be fully-qualified module names, optionally "
-                      "with '*' in some components (e.g spam.*.eggs.*)"
-                      % config_file, file=stderr)
+            for glob, override in value.items():
+                if (any(c in glob for c in '?[]!') or
+                        any('*' in x and x != '*' for x in glob.split('.'))):
+                    print("%s: Patterns must be fully-qualified module names, optionally "
+                          "with '*' in some components (e.g spam.*.eggs.*)"
+                          % filename, file=stderr)
 
-            values = {}
-            for subkey, value in table['mypy'][key].items():
-                if subkey.endswith('_report'):
-                    print("Per-module tables [%s] should not specify reports (%s)" %
-                          (key, subkey), file=stderr)
-                    continue
-                elif subkey not in PER_MODULE_OPTIONS:
-                    print("Per-module tables [%s] should only specify per-module flags (%s)" %
-                          (key, subkey), file=stderr)
-                    continue
+                values = {}
+                for subkey, subvalue in override.items():
+                    if subkey.endswith('_report'):
+                        print("Per-module override [%s] should not specify reports (%s)" %
+                              (glob, subkey), file=stderr)
+                        continue
+                    elif subkey not in PER_MODULE_OPTIONS:
+                        print("Per-module tables [%s] should only specify per-module flags (%s)" %
+                              (key, subkey), file=stderr)
+                        continue
 
-                if subkey in toml_type_conversors:
-                    value = toml_type_conversors[subkey](value)
-                values[subkey] = value
+                    if subkey in toml_type_conversors:
+                        subvalue = toml_type_conversors[subkey](subvalue)
+                    values[subkey] = subvalue
 
-            options.per_module_options[glob] = values
+                options.per_module_options[glob] = values
+    return True
 
 
 def parse_ini_config_file(options: Options, filename: Optional[str],
                           stdout: Optional[TextIO] = None,
-                          stderr: Optional[TextIO] = None) -> None:
-    stdout = stdout or sys.stdout
+                          stderr: Optional[TextIO] = None) -> bool:
     stderr = stderr or sys.stderr
-
-    if filename is not None:
-        config_files = (filename,)  # type: Tuple[str, ...]
-    else:
-        config_files = tuple(map(os.path.expanduser, defaults.INI_CONFIG_FILES))
-
     parser = configparser.RawConfigParser()
+    retv = False
 
-    for config_file in config_files:
-        if not os.path.exists(config_file):
-            continue
-        try:
-            parser.read(config_file)
-        except configparser.Error as err:
-            print("%s: %s" % (config_file, err), file=stderr)
-        else:
-            file_read = config_file
-            options.config_file = file_read
-            break
+    try:
+        parser.read(filename)
+    except configparser.Error as err:
+        print("%s: %s" % (filename, err), file=stderr)
+        return retv
     else:
-        return
+        options.config_file = filename
 
     if 'mypy' not in parser:
-        if filename or file_read not in defaults.SHARED_CONFIG_FILES:
-            print("%s: No [mypy] section in config file" % file_read, file=stderr)
+        if filename not in defaults.SHARED_CONFIG_FILES:
+            print("%s: No [mypy] section in config file" % filename, file=stderr)
     else:
+        retv = True
         section = parser['mypy']
-        prefix = '%s: [%s]: ' % (file_read, 'mypy')
-        updates, report_dirs = parse_section(prefix, options, section, stderr)
+        prefix = '%s: [%s]: ' % (filename, 'mypy')
+        updates, report_dirs = parse_ini_section(prefix, options, section, stderr)
         for k, v in updates.items():
             setattr(options, k, v)
         options.report_dirs.update(report_dirs)
 
     for name, section in parser.items():
         if name.startswith('mypy-'):
-            prefix = '%s: [%s]: ' % (file_read, name)
-            updates, report_dirs = parse_section(prefix, options, section, stderr)
+            retv = True
+            prefix = '%s: [%s]: ' % (filename, name)
+            updates, report_dirs = parse_ini_section(prefix, options, section, stderr)
             if report_dirs:
                 print("%sPer-module sections should not specify reports (%s)" %
                       (prefix, ', '.join(s + '_report' for s in sorted(report_dirs))),
@@ -259,12 +260,13 @@ def parse_ini_config_file(options: Options, filename: Optional[str],
                           file=stderr)
                 else:
                     options.per_module_options[glob] = updates
+    return retv
 
 
-def parse_section(prefix: str, template: Options,
-                  section: Mapping[str, str],
-                  stderr: TextIO = sys.stderr
-                  ) -> Tuple[Dict[str, object], Dict[str, str]]:
+def parse_ini_section(prefix: str, template: Options,
+                      section: Mapping[str, str],
+                      stderr: TextIO = sys.stderr
+                      ) -> Tuple[Dict[str, object], Dict[str, str]]:
     """Parse one section of a config file.
 
     Returns a dict of option values encountered, and a dict of report directories.
@@ -429,7 +431,7 @@ def parse_mypy_comments(
         errors.extend((lineno, x) for x in parse_errors)
 
         stderr = StringIO()
-        new_sections, reports = parse_section('', template, parser['dummy'], stderr=stderr)
+        new_sections, reports = parse_ini_section('', template, parser['dummy'], stderr=stderr)
         errors.extend((lineno, x) for x in stderr.getvalue().strip().split('\n') if x)
         if reports:
             errors.append((lineno, "Reports not supported in inline configuration"))
