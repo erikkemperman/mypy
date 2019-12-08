@@ -479,7 +479,7 @@ disallow_incomplete_defs = True
 
 
 [case testPerFileStrictOptionalBasic]
-# flags: --config-file tmp/mypy.ini
+# flags: --config-file tmp/pyproject.toml
 import standard, optional
 
 [file standard.py]
@@ -491,12 +491,11 @@ x = 0
 if int():
     x = None  # E: Incompatible types in assignment (expression has type "None", variable has type "int")
 
-[file mypy.ini]
-\[mypy]
-strict_optional = False
-\[mypy-optional]
-strict_optional = True
-
+[file pyproject.toml]
+\[tool.mypy]
+strict_optional = false
+\[tool.mypy-optional]
+strict_optional = true
 
 [case testPerFileStrictOptionalBasicImportStandard]
 # flags: --config-file tmp/mypy.ini

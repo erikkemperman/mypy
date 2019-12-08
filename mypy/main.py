@@ -437,7 +437,7 @@ def process_options(args: List[str],
     config_group.add_argument(
         '--config-file',
         help="Configuration file, must have a [mypy] section "
-             "(defaults to {})".format(', '.join(defaults.CONFIG_FILES)))
+             "(defaults to {})".format(', '.join(defaults.INI_CONFIG_FILES)))
     add_invertible_flag('--warn-unused-configs', default=False, strict_flag=True,
                         help="Warn about unused '[mypy-<pattern>]' config sections",
                         group=config_group)

@@ -7771,10 +7771,10 @@ def f() -> str: return '0'
 ==
 
 [case testRefreshIgnoreErrors1]
-[file mypy.ini]
-\[mypy]
-\[mypy-b]
-ignore_errors = True
+[file pyproject.toml]
+\[tool.mypy]
+\[tool.mypy-b]
+ignore_errors = true
 [file a.py]
 y = '1'
 [file a.py.2]

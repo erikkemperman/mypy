@@ -6,6 +6,7 @@ import os
 import re
 import sys
 
+import toml  # type: ignore
 from typing import Any, Dict, List, Mapping, Optional, Tuple, TextIO
 from typing_extensions import Final
 
@@ -50,9 +51,20 @@ def split_and_match_files(paths: str) -> List[str]:
 
     Returns a list of file paths
     """
+
+    return match_files(paths.split(','))
+
+
+def match_files(paths: List[str]) -> List[str]:
+    """Take list of files/directories (with support for globbing through the glob library).
+
+    Where a path/glob matches no file, we still include the raw path in the resulting list.
+
+    Returns a list of file paths
+    """
     expanded_paths = []
 
-    for path in paths.split(','):
+    for path in paths:
         path = expand_path(path.strip())
         globbed_files = fileglob.glob(path, recursive=True)
         if globbed_files:
@@ -67,7 +79,7 @@ def split_and_match_files(paths: str) -> List[str]:
 # sufficient, and we don't have to do anything here.  This table
 # exists to specify types for values initialized to None or container
 # types.
-config_types = {
+ini_config_types = {
     'python_version': parse_version,
     'strict_optional_whitelist': lambda s: s.split(),
     'custom_typing_module': str,
@@ -88,6 +100,16 @@ config_types = {
 }  # type: Final
 
 
+toml_type_conversors = {
+    'python_version': parse_version,
+    'custom_typeshed_dir': expand_path,
+    'mypy_path': lambda l: [expand_path(p) for p in l],
+    'files': match_files,
+    'cache_dir': expand_path,
+    'python_executable': expand_path,
+}
+
+
 def parse_config_file(options: Options, filename: Optional[str],
                       stdout: Optional[TextIO] = None,
                       stderr: Optional[TextIO] = None) -> None:
@@ -97,13 +119,90 @@ def parse_config_file(options: Options, filename: Optional[str],
 
     If filename is None, fall back to default config files.
     """
+    if filename is None or os.path.splitext(filename)[1] == '.toml':
+        parse_toml_config_file(options, filename, stderr)
+    else:
+        parse_ini_config_file(options, filename, stdout, stderr)
+
+
+def parse_toml_config_file(options: Options, filename: Optional[str],
+                           stdout: Optional[TextIO] = None,
+                           stderr: Optional[TextIO] = None) -> None:
+    stderr = stderr or sys.stderr
+
+    # Load the toml config file,
+    config_file = filename or defaults.TOML_CONFIG_FILE
+    if not os.path.exists(config_file):
+        return
+    try:
+        table = toml.load(config_file)  # type: Dict[str, Any]
+    except (TypeError, toml.TomlDecodeError, IOError) as err:
+        print("%s: %s" % (config_file, err), file=stderr)
+        return
+    else:
+        options.config_file = config_file
+
+    if 'mypy' not in table:
+        print("%s: No [mypy] table in config file" % config_file, file=stderr)
+        return
+
+    # Handle the mypy table.
+    for key, value in table['mypy'].items():
+
+        # Is an option.
+        if not isinstance(value, dict):
+
+            # Is a report directory.
+            if key.endswith('_report'):
+                report_type = key[:-7].replace('_', '-')
+                if report_type in defaults.REPORTER_NAMES:
+                    options.report_dirs[report_type] = table['mypy'][key]
+                else:
+                    print("%s: Unrecognized report type: %s" %
+                          (config_file, key),
+                          file=stderr)
+            else:
+                if key in toml_type_conversors:
+                    value = toml_type_conversors[key](value)
+                setattr(options, key, value)
+
+        # Is a subtable. Should be a package/module glob.
+        else:
+            glob = key
+            if (any(c in glob for c in '?[]!') or
+                    any('*' in x and x != '*' for x in glob.split('.'))):
+                print("%s: Patterns must be fully-qualified module names, optionally "
+                      "with '*' in some components (e.g spam.*.eggs.*)"
+                      % config_file, file=stderr)
+
+            values = {}
+            for subkey, value in table['mypy'][key].items():
+                if subkey.endswith('_report'):
+                    print("Per-module tables [%s] should not specify reports (%s)" %
+                          (key, subkey), file=stderr)
+                    continue
+                elif subkey not in PER_MODULE_OPTIONS:
+                    print("Per-module tables [%s] should only specify per-module flags (%s)" %
+                          (key, subkey), file=stderr)
+                    continue
+
+                if subkey in toml_type_conversors:
+                    value = toml_type_conversors[subkey](value)
+                values[subkey] = value
+
+            options.per_module_options[glob] = values
+
+
+def parse_ini_config_file(options: Options, filename: Optional[str],
+                          stdout: Optional[TextIO] = None,
+                          stderr: Optional[TextIO] = None) -> None:
     stdout = stdout or sys.stdout
     stderr = stderr or sys.stderr
 
     if filename is not None:
         config_files = (filename,)  # type: Tuple[str, ...]
     else:
-        config_files = tuple(map(os.path.expanduser, defaults.CONFIG_FILES))
+        config_files = tuple(map(os.path.expanduser, defaults.INI_CONFIG_FILES))
 
     parser = configparser.RawConfigParser()
 
@@ -175,8 +274,8 @@ def parse_section(prefix: str, template: Options,
     for key in section:
         invert = False
         options_key = key
-        if key in config_types:
-            ct = config_types[key]
+        if key in ini_config_types:
+            ct = ini_config_types[key]
         else:
             dv = None
             # We have to keep new_semantic_analyzer in Options
