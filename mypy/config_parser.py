@@ -107,7 +107,7 @@ toml_type_conversors = {
     'files': match_files,
     'cache_dir': expand_path,
     'python_executable': expand_path,
-} # type: Final
+}  # type: Final
 
 
 def parse_config_file(options: Options, filename: Optional[str],
@@ -138,7 +138,7 @@ def parse_config_file(options: Options, filename: Optional[str],
                 break
 
 
-def parse_toml_config_file(options: Options, filename: Optional[str],
+def parse_toml_config_file(options: Options, filename: str,
                            stdout: Optional[TextIO] = None,
                            stderr: Optional[TextIO] = None) -> bool:
     stderr = stderr or sys.stderr
@@ -173,7 +173,7 @@ def parse_toml_config_file(options: Options, filename: Optional[str],
                           file=stderr)
             else:
                 if key in toml_type_conversors:
-                    value = toml_type_conversors[key](value)
+                    value = toml_type_conversors[key](value)  # type: ignore
                 setattr(options, key, value)
 
         # Read the per-module override sub-tables.
@@ -197,14 +197,14 @@ def parse_toml_config_file(options: Options, filename: Optional[str],
                         continue
 
                     if subkey in toml_type_conversors:
-                        subvalue = toml_type_conversors[subkey](subvalue)
+                        subvalue = toml_type_conversors[subkey](subvalue)  # type: ignore
                     values[subkey] = subvalue
 
                 options.per_module_options[glob] = values
     return True
 
 
-def parse_ini_config_file(options: Options, filename: Optional[str],
+def parse_ini_config_file(options: Options, filename: str,
                           stdout: Optional[TextIO] = None,
                           stderr: Optional[TextIO] = None) -> bool:
     stderr = stderr or sys.stderr

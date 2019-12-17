@@ -170,13 +170,15 @@ def f():
     except ZeroDivisionError, err:
         print err
 
-[case testNoConfigFile]
+[case testWarnUnusedIgnores]
 # cmd: mypy main.py --config-file=
-[file mypy.ini]
+[file pyproject.toml]
 \[mypy]
-warn_unused_ignores = True
+warn_unused_ignores = true
 [file main.py]
 # type: ignore
+[out]
+main.py:1: error: unused 'type: ignore' comment
 
 [case testPerFileConfigSection]
 # cmd: mypy x.py y.py z.py
