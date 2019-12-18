@@ -11,7 +11,7 @@ SHARED_CONFIG_FILES = ['setup.cfg', ]  # type: Final
 USER_CONFIG_FILES = ['~/.config/mypy/config', '~/.mypy.ini', ]  # type: Final
 if os.environ.get('XDG_CONFIG_HOME'):
     USER_CONFIG_FILES.insert(0, os.path.join(os.environ['XDG_CONFIG_HOME'], 'mypy/config'))
-TOML_CONFIG_FILE = 'pyproject.toml'
+TOML_CONFIG_FILE = 'pyproject.toml'  # type: Final
 CONFIG_FILES = (
     [INI_CONFIG_FILE, TOML_CONFIG_FILE]
     + SHARED_CONFIG_FILES

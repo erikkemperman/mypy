@@ -79,7 +79,7 @@ def match_files(paths: List[str]) -> List[str]:
 # sufficient, and we don't have to do anything here.  This table
 # exists to specify types for values initialized to None or container
 # types.
-ini_config_types = {
+ini_type_converters = {
     'python_version': parse_version,
     'strict_optional_whitelist': lambda s: s.split(),
     'custom_typing_module': str,
@@ -100,7 +100,7 @@ ini_config_types = {
 }  # type: Final
 
 
-toml_type_conversors = {
+toml_type_converters = {
     'python_version': parse_version,
     'custom_typeshed_dir': expand_path,
     'mypy_path': lambda l: [expand_path(p) for p in l],
@@ -172,8 +172,8 @@ def parse_toml_config_file(options: Options, filename: str,
                           (filename, key),
                           file=stderr)
             else:
-                if key in toml_type_conversors:
-                    value = toml_type_conversors[key](value)  # type: ignore
+                if key in toml_type_converters:
+                    value = toml_type_converters[key](value)  # type: ignore
                 setattr(options, key, value)
 
         # Read the per-module override sub-tables.
@@ -196,8 +196,8 @@ def parse_toml_config_file(options: Options, filename: str,
                               (key, subkey), file=stderr)
                         continue
 
-                    if subkey in toml_type_conversors:
-                        subvalue = toml_type_conversors[subkey](subvalue)  # type: ignore
+                    if subkey in toml_type_converters:
+                        subvalue = toml_type_converters[subkey](subvalue)  # type: ignore
                     values[subkey] = subvalue
 
                 options.per_module_options[glob] = values
@@ -276,8 +276,8 @@ def parse_ini_section(prefix: str, template: Options,
     for key in section:
         invert = False
         options_key = key
-        if key in ini_config_types:
-            ct = ini_config_types[key]
+        if key in ini_type_converters:
+            ct = ini_type_converters[key]
         else:
             dv = None
             # We have to keep new_semantic_analyzer in Options
