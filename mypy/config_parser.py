@@ -119,7 +119,7 @@ def parse_config_file(options: Options, filename: Optional[str],
 
     If filename is None, fall back to default config files.
     """
-    if filename:
+    if filename is not None:
         filename = os.path.expanduser(filename)
         if os.path.splitext(filename)[1] == '.toml':
             parse_toml_config_file(options, filename, stdout, stderr)
