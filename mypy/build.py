@@ -378,7 +378,12 @@ def load_plugins_from_config(
     if not options.config_file:
         return [], snapshot
 
-    line = find_config_file_line_number(options.config_file, 'mypy', 'plugins')
+    find_section = 'mypy'
+    if options.config_file.endswith('pyproject.toml'):
+        find_section = 'tool.mypy'
+
+    line = find_config_file_line_number(options.config_file, find_section, 'plugins')
+
     if line == -1:
         line = 1  # We need to pick some line number that doesn't look too confusing
 
