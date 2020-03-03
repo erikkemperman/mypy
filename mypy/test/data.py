@@ -201,6 +201,7 @@ class DataDrivenTestCase(pytest.Item):  # type: ignore  # inheriting from Any
         super().__init__(name, parent)
         self.suite = suite
         self.file = file
+        self.name = name
         self.writescache = writescache
         self.only_when = only_when
         if ((platform == 'windows' and sys.platform != 'win32')
@@ -535,14 +536,99 @@ def split_test_cases(parent: 'DataSuiteCollector', suite: 'DataSuite',
     for i in range(1, len(cases), 6):
         name, writescache, only_when, platform_flag, skip, data = cases[i:i + 6]
         platform = platform_flag[1:] if platform_flag else None
+        full_name = add_test_name_suffix(name, suite.test_name_suffix)
         yield DataDrivenTestCase(parent, suite, file,
-                                 name=add_test_name_suffix(name, suite.test_name_suffix),
+                                 name=full_name,
                                  writescache=bool(writescache),
                                  only_when=only_when,
                                  platform=platform,
                                  skip=bool(skip),
                                  data=data,
                                  line=line_no)
+
+        # For cases with # flags: --config-file tmp/mypy.ini, emit an additional
+        # case using tmp/pyproject.toml automagically
+        new_data = []
+        do_copy = False
+        in_toml = False
+        lines = data.split('\n')
+        line_idx = 0
+        while line_idx < len(lines):
+            line = lines[line_idx]
+            new_line = line
+            if re.match(r'^#\s*flags\s*:', line) is not None:
+                new_line = re.sub(r'(\s+--config-file\s+tmp/)mypy.ini',
+                                  r'\1pyproject.toml', new_line)
+                if new_line == line:
+                    break
+                do_copy = True
+            elif new_line.startswith('['):
+                new_line = re.sub(r'^(\s*\[file\s+)mypy.ini',
+                                  r'\1pyproject.toml', new_line)
+                in_toml = new_line != line
+
+            elif in_toml:
+                if new_line.startswith('\\['):
+                    new_line = re.sub(r'^\\\[mypy]',
+                                      '\\[tool.mypy]', new_line)
+                    new_line = re.sub(r'^\\\[mypy-([^]]+)]',
+                                      r'\\[tool.mypy.overrides."\1"]', new_line)
+                else:
+                    match = re.match(r'^\s*([^=\s]*)\s*=\s*([^\s].*)$', new_line)
+                    if match is not None:
+                        key = match.group(1)
+                        val = match.group(2)
+
+                        def _parse_val(val):  # type: (str) -> Any
+                            if val in ('True', 'False'):
+                                new_val = val.lower()
+                            else:
+                                try:
+                                    new_val = str(int(val))
+                                except ValueError:
+                                    try:
+                                        new_val = str(float(val))
+                                    except ValueError:
+                                        new_val = '"' + val + '"'
+                            return new_val
+
+                        if key == 'python_version':
+                            new_line = key + ' = "' + val + '"'
+                        elif key in (
+                            'mypy_path',
+                            'plugins',
+                            'package_root',
+                            'always_true', 'always_false',
+                            'files'
+                        ):
+                            new_val = re.split(r'\s*,\s*', val)
+                            while new_val[-1] == '':
+                                new_val = new_val[:-1]
+                                line_idx += 1
+                                line = lines[line_idx]
+                                new_val.extend(re.split(r'\s*,\s*', line))
+
+                            new_val = list(_parse_val(v.strip()) for v in new_val)
+                            new_line = key + ' = ' + '[' + ','.join(new_val) + ']'
+                        else:
+                            new_line = key + ' = ' + _parse_val(val)
+            else:
+                new_line = re.sub(r'^tmp/mypy.ini:', 'tmp/pyproject.toml:', new_line)
+
+            new_data.append(new_line)
+            line_idx += 1
+
+        if do_copy:
+            full_name = add_test_name_suffix(name + 'Toml', suite.test_name_suffix)
+            yield DataDrivenTestCase(parent, suite, file,
+                                     name=full_name,
+                                     writescache=bool(writescache),
+                                     only_when=only_when,
+                                     platform=platform,
+                                     skip=bool(skip),
+                                     data='\n'.join(new_data),
+                                     line=line_no)
+
         line_no += data.count('\n') + 1
 
 
