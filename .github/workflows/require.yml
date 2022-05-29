@@ -1,0 +1,38 @@
+name: Reusable workflow to share requirement versions
+
+on:
+  workflow_call:
+    # Map the workflow outputs to job outputs
+    outputs:
+      basepython:
+        value: ${{ jobs.require.outputs.basepython }}
+      setuptools:
+        description: "Share version of setuptools"
+        value: ${{ jobs.require.outputs.setuptools }}
+      virtualenv:
+        description: "Share version of virtualenv"
+        value: ${{ jobs.require.outputs.virtualenv }}
+      tox:
+        description: "Share version of tox"
+        value: ${{ jobs.require.outputs.tox }}
+
+jobs:
+  require:
+    name: Source some requirements from tox.ini and test-requirements.txt
+    runs-on: ubuntu-latest
+    # Map the job outputs to step outputs
+    outputs:
+      basepython: ${{ steps.basepython.outputs.require }}
+      setuptools: ${{ steps.setuptools.outputs.require }}
+      virtualenv: ${{ steps.virtualenv.outputs.require }}
+      tox: ${{ steps.tox.outputs.require }}
+    steps:
+      - uses: actions/checkout@v2
+      - id: basepython
+        run: echo "::set-output name=require::'3.$(grep '^basepython' tox.ini | grep -o '[0-9]\+$' | sort -nu | tail -n1)'"
+      - id: setuptools
+        run: echo "::set-output name=require::'$(grep '^setuptools[\!<=>]\+' test-requirements.txt | tail -n1)'"
+      - id: virtualenv
+        run: echo "::set-output name=require::'$(grep '^virtualenv[\!<=>]\+' test-requirements.txt | tail -n1)'"
+      - id: tox
+        run: echo "::set-output name=require::'$(grep '^tox[\!<=>]\+' test-requirements.txt | tail -n1)'"

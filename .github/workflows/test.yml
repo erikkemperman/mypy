@@ -15,10 +15,13 @@ on:
     - LICENSE
 
 jobs:
+  require:
+    uses: ./.github/workflows/require.yml
   main:
     runs-on: ${{ matrix.os }}
+    needs: require
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
         - name: Test suite with py37-windows-32
@@ -77,17 +80,17 @@ jobs:
           tox_extra_args: "-n 2 mypyc/test/test_run.py mypyc/test/test_external.py"
           debug_build: true
         - name: Type check our own code (py37-ubuntu)
-          python: '3.7'
+          python: ${{ needs.require.outputs.basepython }}
           arch: x64
           os: ubuntu-latest
           toxenv: type
         - name: Type check our own code (py37-windows-64)
-          python: '3.7'
+          python: ${{ needs.require.outputs.basepython }}
           arch: x64
           os: windows-latest
           toxenv: type
         - name: Code style with flake8
-          python: '3.7'
+          python: ${{ needs.require.outputs.basepython }}
           arch: x64
           os: ubuntu-latest
           toxenv: lint
@@ -108,19 +111,20 @@ jobs:
         ./misc/build-debug-python.sh $PYTHONVERSION $PYTHONDIR $VENV
         source $VENV/bin/activate
     - name: Install tox
-      run: pip install --upgrade 'setuptools!=50' 'virtualenv>=20.6.0' tox==3.24.5
+      run: pip install --upgrade ${{ needs.require.outputs.setuptools }} ${{ needs.require.outputs.virtualenv }} ${{ needs.require.outputs.tox }}
     - name: Compiled with mypyc
       if: ${{ matrix.test_mypyc }}
       run: |
         pip install -r test-requirements.txt
         CC=clang MYPYC_OPT_LEVEL=0 python3 setup.py --use-mypyc build_ext --inplace
     - name: Setup tox environment
-      run: tox -e ${{ matrix.toxenv }} --notest
+      run: tox -e ${{ matrix.toxenv }} --notest --no-provision
     - name: Test
-      run: tox -e ${{ matrix.toxenv }} --skip-pkg-install -- ${{ matrix.tox_extra_args }}
+      run: tox -e ${{ matrix.toxenv }} --skip-pkg-install --skip-missing-interpreters false -- ${{ matrix.tox_extra_args }}
 
   python-nightly:
     runs-on: ubuntu-latest
+    needs: require
     name: Test suite with Python nightly
     steps:
     - uses: actions/checkout@v2
@@ -128,11 +132,11 @@ jobs:
       with:
         python-version: '3.11-dev'
     - name: Install tox
-      run: pip install --upgrade 'setuptools!=50' 'virtualenv>=20.6.0' tox==3.24.5
+      run: pip install --upgrade ${{ needs.require.outputs.setuptools }} ${{ needs.require.outputs.virtualenv }} ${{ needs.require.outputs.tox }}
     - name: Setup tox environment
-      run: tox -e py --notest
+      run: tox -e py --notest --no-provision
     - name: Test
-      run: tox -e py --skip-pkg-install -- "-n 2"
+      run: tox -e py --skip-pkg-install --skip-missing-interpreters false -- "-n 2"
       continue-on-error: true
     - name: Mark as a success
       run: exit 0

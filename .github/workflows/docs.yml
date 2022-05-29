@@ -14,18 +14,21 @@ on:
     - LICENSE
 
 jobs:
+  require:
+    uses: ./.github/workflows/require.yml
   docs:
     runs-on: ubuntu-latest
+    needs: require
     env:
       TOXENV: docs
     steps:
       - uses: actions/checkout@v2
       - uses: actions/setup-python@v2
         with:
-          python-version: '3.10'
+          python-version: ${{ needs.require.outputs.basepython }}
       - name: Install tox
-        run: pip install --upgrade 'setuptools!=50' 'virtualenv>=20.6.0' tox==3.24.5
+        run: pip install --upgrade ${{ needs.require.outputs.setuptools }} ${{ needs.require.outputs.virtualenv }} ${{ needs.require.outputs.tox }}
       - name: Setup tox environment
-        run: tox -e ${{ env.TOXENV }} --notest
+        run: tox -e ${{ env.TOXENV }} --notest --no-provision
       - name: Test
-        run: tox -e ${{ env.TOXENV }} --skip-pkg-install
+        run: tox -e ${{ env.TOXENV }} --skip-pkg-install --skip-missing-interpreters false
