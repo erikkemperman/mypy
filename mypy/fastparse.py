@@ -111,6 +111,7 @@ from mypy.types import (
     CallableType,
     EllipsisType,
     Instance,
+    IntersectionType,
     ProperType,
     RawExpressionType,
     TupleType,
@@ -1963,12 +1964,13 @@ class TypeConverter:
         return UnboundType(n.id, line=self.line, column=self.convert_column(n.col_offset))
 
     def visit_BinOp(self, n: ast3.BinOp) -> Type:
-        if not isinstance(n.op, ast3.BitOr):
+        if not isinstance(n.op, (ast3.BitOr, ast3.BitAnd)):
             return self.invalid_type(n)
 
         left = self.visit(n.left)
         right = self.visit(n.right)
-        return UnionType(
+        junction = UnionType if isinstance(n.op, ast3.BitOr) else IntersectionType
+        return junction(
             [left, right],
             line=self.line,
             column=self.convert_column(n.col_offset),

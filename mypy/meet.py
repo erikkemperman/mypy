@@ -15,7 +15,12 @@ from mypy.subtypes import (
     is_same_type,
     is_subtype,
 )
-from mypy.typeops import is_recursive_pair, make_simplified_union, tuple_fallback
+from mypy.typeops import (
+    is_recursive_pair,
+    make_simplified_intersection,
+    make_simplified_union,
+    tuple_fallback
+)
 from mypy.types import (
     MYPYC_NATIVE_INT_NAMES,
     TUPLE_LIKE_INSTANCE_NAMES,
@@ -25,6 +30,7 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -104,6 +110,8 @@ def meet_types(s: Type, t: Type) -> ProperType:
     if isinstance(s, AnyType):
         return t
     if isinstance(s, UnionType) and not isinstance(t, UnionType):
+        s, t = t, s
+    if isinstance(s, IntersectionType) and not isinstance(t, IntersectionType):
         s, t = t, s
 
     # Meets/joins require callable type normalization.
@@ -741,6 +749,16 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
         else:
             meets = [meet_types(x, self.s) for x in t.items]
         return make_simplified_union(meets)
+
+    def visit_intersection_type(self, t: IntersectionType) -> ProperType:
+        if isinstance(self.s, IntersectionType):
+            meets: list[Type] = []
+            for x in t.items:
+                for y in self.s.items:
+                    meets.append(meet_types(x, y))
+        else:
+            meets = [meet_types(x, self.s) for x in t.items]
+        return make_simplified_intersection(meets)
 
     def visit_none_type(self, t: NoneType) -> ProperType:
         if state.strict_optional:

@@ -28,6 +28,7 @@ from mypy.types import (
     DeletedType,
     ErasedType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     NormalizedCallableType,
@@ -334,6 +335,11 @@ def _infer_constraints(
         template = mypy.typeops.make_simplified_union(template.items, keep_erased=True)
     if isinstance(actual, UnionType):
         actual = mypy.typeops.make_simplified_union(actual.items, keep_erased=True)
+    # Similar for intersections.
+    if isinstance(template, IntersectionType):
+        template = mypy.typeops.make_simplified_intersection(template.items, keep_erased=True)
+    if isinstance(actual, IntersectionType):
+        actual = mypy.typeops.make_simplified_intersection(actual.items, keep_erased=True)
 
     # Ignore Any types from the type suggestion engine to avoid them
     # causing us to infer Any in situations where a better job could
@@ -369,7 +375,7 @@ def _infer_constraints(
     ):
         # Unless template is also a type variable (or a union that contains one), using the upper
         # bound for inference will usually give better result for actual that is a type variable.
-        if not isinstance(template, UnionType) or not any(
+        if not isinstance(template, (UnionType, IntersectionType)) or not any(
             isinstance(t, TypeVarType) for t in template.items
         ):
             actual = get_proper_type(actual.upper_bound)
@@ -392,6 +398,7 @@ def _infer_constraints(
                 a_item = TypeType.make_normalized(a_item)
             res.extend(infer_constraints(orig_template, a_item, direction))
         return res
+    # TODO intersection
 
     # Now the potential subtype is known not to be a Union or a type
     # variable that we are solving for. In that case, for a Union to
@@ -1340,6 +1347,12 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
     def visit_union_type(self, template: UnionType) -> list[Constraint]:
         assert False, (
             "Unexpected UnionType in ConstraintBuilderVisitor"
+            " (should have been handled in infer_constraints)"
+        )
+
+    def visit_intersection_type(self, template: IntersectionType) -> list[Constraint]:
+        assert False, (
+            "Unexpected IntersectionType in ConstraintBuilderVisitor"
             " (should have been handled in infer_constraints)"
         )
 

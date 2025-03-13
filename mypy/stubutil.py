@@ -21,6 +21,7 @@ from mypy.nodes import PARAM_SPEC_KIND, TYPE_VAR_TUPLE_KIND, ClassDef, FuncDef, 
 from mypy.stubdoc import ArgSig, FunctionSig
 from mypy.types import (
     AnyType,
+    IntersectionType,
     NoneType,
     Type,
     TypeList,
@@ -300,6 +301,9 @@ class AnnotationPrinter(TypeStrVisitor):
 
     def visit_union_type(self, t: UnionType) -> str:
         return " | ".join([item.accept(self) for item in t.items])
+
+    def visit_intersection_type(self, t: IntersectionType) -> str:
+        return " & ".join([item.accept(self) for item in t.items])
 
     def visit_unpack_type(self, t: UnpackType) -> str:
         if self.options.python_version >= (3, 11):

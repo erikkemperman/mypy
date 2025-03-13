@@ -93,6 +93,7 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    flatten_nested_intersections,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
@@ -3383,6 +3384,22 @@ def append_union_note(
     if non_matching:
         types = ", ".join([format_type(typ, options) for typ in non_matching])
         notes.append(f"Item{plural_s(non_matching)} in the first union not in the second: {types}")
+    return notes
+
+def append_intersection_note(
+    notes: list[str], arg_type: IntersectionType, expected_type: IntersectionType, options: Options
+) -> list[str]:
+    """Point to specific intersection item(s) that may cause failure in subtype check."""
+    non_matching = []
+    items = flatten_nested_intersections(arg_type.items)
+    if len(items) < MAX_INTERSECTION_ITEMS:
+        return notes
+    for item in items:
+        if not is_subtype(item, expected_type):
+            non_matching.append(item)
+    if non_matching:
+        types = ", ".join([format_type(typ, options) for typ in non_matching])
+        notes.append(f"Item{plural_s(non_matching)} in the first intersection not in the second: {types}")
     return notes
 
 

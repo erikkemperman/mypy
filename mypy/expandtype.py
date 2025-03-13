@@ -14,6 +14,7 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -37,6 +38,7 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    flatten_nested_intersections,
     flatten_nested_unions,
     get_proper_type,
     split_with_prefix_and_suffix,
@@ -485,6 +487,31 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
         # can cause recursion, so we just remove strict duplicates.
         simplified = UnionType.make_union(
             remove_trivial(flatten_nested_unions(expanded)), t.line, t.column
+        )
+        # This call to get_proper_type() is unfortunate but is required to preserve
+        # the invariant that ProperType will stay ProperType after applying expand_type(),
+        # otherwise a single item union of a type alias will break it. Note this should not
+        # cause infinite recursion since pathological aliases like A = Union[A, B] are
+        # banned at the semantic analysis level.
+        result = get_proper_type(simplified)
+
+        if use_cache:
+            self.set_cached(t, result)
+        return result
+
+    def visit_intersection_type(self, t: IntersectionType) -> Type:
+        # Use cache to avoid O(n**2) or worse expansion of types during translation
+        # (only for large unions, since caching adds overhead)
+        use_cache = len(t.items) > 3
+        if use_cache and (cached := self.get_cached(t)):
+            return cached
+
+        expanded = self.expand_types(t.items)
+        # After substituting for type variables in t.items, some resulting types
+        # might be subtypes of others, however calling  make_simplified_union()
+        # can cause recursion, so we just remove strict duplicates.
+        simplified = IntersectionType.make_intersection(
+            remove_trivial(flatten_nested_intersections(expanded)), t.line, t.column
         )
         # This call to get_proper_type() is unfortunate but is required to preserve
         # the invariant that ProperType will stay ProperType after applying expand_type(),

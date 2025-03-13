@@ -155,6 +155,12 @@ TYPE_ALWAYS_TRUE: Final = ErrorMessage(
     "so it could always be true in boolean context",
     code=codes.TRUTHY_BOOL,
 )
+# TODO this is just the same as union
+TYPE_ALWAYS_TRUE_INTERSECTIONTYPE: Final = ErrorMessage(
+    "{} of which no members implement __bool__ or __len__ "
+    "so it could always be true in boolean context",
+    code=codes.TRUTHY_BOOL,
+)
 TYPE_ALWAYS_TRUE_UNIONTYPE: Final = ErrorMessage(
     "{} of which no members implement __bool__ or __len__ "
     "so it could always be true in boolean context",

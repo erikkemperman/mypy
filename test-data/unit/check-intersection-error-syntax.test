@@ -1,5 +1,6 @@
+-- TODO add --python-version 3.XY hopefully sometime
+
 [case testIntersectionErrorSyntax]
-# TODO add --python-version 3.XY hopefully sometime
 # flags: --python-version 3.13 --no-force-intersection-syntax
 from typing import Intersection
 x : Intersection[bool, str]

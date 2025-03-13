@@ -65,6 +65,7 @@ from mypy.types import (
     CallableType,
     FunctionLike,
     Instance,
+    IntersectionType,
     NoneType,
     ProperType,
     TupleType,
@@ -872,6 +873,9 @@ class TypeFormatter(TypeStrVisitor):
             return f"Optional[{remove_optional(t).accept(self)}]"
         else:
             return super().visit_union_type(t)
+
+    def visit_intersection_type(self, t: IntersectionType) -> str:
+        return super().visit_union_type(t)
 
     def visit_callable_type(self, t: CallableType) -> str:
         # TODO: use extended callables?

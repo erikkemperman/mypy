@@ -196,7 +196,7 @@ def f(x: Union[int, str, None]) -> None:
         reveal_type(x)  # N: Revealed type is "None"
 [builtins fixtures/isinstance.pyi]
 
-[case testImplicit604TypeAliasWithCyclicImportInStub]
+[case testUnionImplicit604TypeAliasWithCyclicImportInStub]
 # flags: --python-version 3.10
 from was_builtins import foo
 reveal_type(foo)  # N: Revealed type is "Union[builtins.str, was_mmap.mmap]"
@@ -240,7 +240,7 @@ def bar(value: object):
 
 
 # TODO: Get this test to pass
-[case testImplicit604TypeAliasWithCyclicImportNotInStub-xfail]
+[case testUnionImplicit604TypeAliasWithCyclicImportNotInStub-xfail]
 # flags: --python-version 3.10
 from was_builtins import foo
 reveal_type(foo)  # N: Revealed type is "Union[builtins.str, was_mmap.mmap]"

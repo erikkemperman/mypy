@@ -25,6 +25,7 @@ from mypy.types import (
     AnyType,
     CallableType,
     Instance,
+    IntersectionType,
     LiteralType,
     Overloaded,
     Parameters,
@@ -360,8 +361,13 @@ class TypeFixer(TypeVisitor[None]):
 
     def visit_union_type(self, ut: UnionType) -> None:
         if ut.items:
-            for it in ut.items:
-                it.accept(self)
+            for item in ut.items:
+                item.accept(self)
+
+    def visit_intersection_type(self, it: IntersectionType) -> None:
+        if it.items:
+            for item in it.items:
+                item.accept(self)
 
     def visit_type_type(self, t: TypeType) -> None:
         t.item.accept(self)

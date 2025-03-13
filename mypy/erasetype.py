@@ -10,6 +10,7 @@ from mypy.types import (
     DeletedType,
     ErasedType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -132,6 +133,12 @@ class EraseTypeVisitor(TypeVisitor[ProperType]):
         from mypy.typeops import make_simplified_union
 
         return make_simplified_union(erased_items)
+
+    def visit_intersection_type(self, t: IntersectionType) -> ProperType:
+        erased_items = [erase_type(item) for item in t.items]
+        from mypy.typeops import make_simplified_intersection
+
+        return make_simplified_intersection(erased_items)
 
     def visit_type_type(self, t: TypeType) -> ProperType:
         return TypeType.make_normalized(t.item.accept(self), line=t.line)
@@ -276,4 +283,37 @@ class LastKnownValueEraser(TypeTranslator):
                 else:
                     merged.append(orig_item)
             return UnionType.make_union(merged)
+        return new
+
+    def visit_intersection_type(self, t: IntersectionType) -> Type:
+        new = cast(IntersectionType, super().visit_intersection_type(t))
+        # Erasure can result in many duplicate items; merge them.
+        # Call make_simplified_intersection only on lists of instance types
+        # that all have the same fullname, to avoid simplifying too
+        # much.
+        instances = [item for item in new.items if isinstance(get_proper_type(item), Instance)]
+        # Avoid merge in simple cases such as optional types.
+        if len(instances) > 1:
+            instances_by_name: dict[str, list[Instance]] = {}
+            p_new_items = get_proper_types(new.items)
+            for p_item in p_new_items:
+                if isinstance(p_item, Instance) and not p_item.args:
+                    instances_by_name.setdefault(p_item.type.fullname, []).append(p_item)
+            merged: list[Type] = []
+            for item in new.items:
+                orig_item = item
+                item = get_proper_type(item)
+                if isinstance(item, Instance) and not item.args:
+                    types = instances_by_name.get(item.type.fullname)
+                    if types is not None:
+                        if len(types) == 1:
+                            merged.append(item)
+                        else:
+                            from mypy.typeops import make_simplified_intersection
+
+                            merged.append(make_simplified_intersection(types))
+                            del instances_by_name[item.type.fullname]
+                else:
+                    merged.append(orig_item)
+            return IntersectionType.make_intersection(merged)
         return new

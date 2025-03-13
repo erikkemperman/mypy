@@ -45,6 +45,7 @@ from mypy.types import (
     FormalArgument,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     NormalizedCallableType,
@@ -1046,6 +1047,48 @@ class SubtypeVisitor(TypeVisitor[bool]):
             return True
 
         elif isinstance(self.right, UnionType):
+            # prune literals early to avoid nasty quadratic behavior which would otherwise arise when checking
+            # subtype relationships between slightly different narrowings of an Enum
+            # we achieve O(N+M) instead of O(N*M)
+
+            fast_check: set[ProperType] = set()
+
+            for item in flatten_types(self.right.relevant_items()):
+                p_item = get_proper_type(item)
+                fast_check.add(p_item)
+                if isinstance(p_item, Instance) and p_item.last_known_value is not None:
+                    fast_check.add(p_item.last_known_value)
+
+            for item in left.relevant_items():
+                p_item = get_proper_type(item)
+                if p_item in fast_check:
+                    continue
+                lit_type = mypy.typeops.simple_literal_type(p_item)
+                if lit_type in fast_check:
+                    continue
+                if not self._is_subtype(item, self.orig_right):
+                    return False
+            return True
+
+        return all(self._is_subtype(item, self.orig_right) for item in left.items)
+
+    def visit_intersection_type(self, left: IntersectionType) -> bool:
+        if isinstance(self.right, Instance):
+            literal_types: set[Instance] = set()
+            # avoid redundant check for union of literals
+            for item in left.relevant_items():
+                p_item = get_proper_type(item)
+                lit_type = mypy.typeops.simple_literal_type(p_item)
+                if lit_type is not None:
+                    if lit_type in literal_types:
+                        continue
+                    literal_types.add(lit_type)
+                    item = lit_type
+                if not self._is_subtype(item, self.orig_right):
+                    return False
+            return True
+
+        elif isinstance(self.right, IntersectionType):
             # prune literals early to avoid nasty quadratic behavior which would otherwise arise when checking
             # subtype relationships between slightly different narrowings of an Enum
             # we achieve O(N+M) instead of O(N*M)

@@ -6,7 +6,7 @@ import itertools
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from contextlib import ExitStack, contextmanager
-from typing import Callable, Final, Generic, NamedTuple, Optional, TypeVar, Union, cast, overload
+from typing import Callable, Final, Generic, Intersection, NamedTuple, Optional, TypeVar, Union, cast, overload
 from typing_extensions import TypeAlias as _TypeAlias, TypeGuard
 
 import mypy.checkexpr
@@ -33,6 +33,7 @@ from mypy.messages import (
     SUGGESTED_TEST_FIXTURES,
     MessageBuilder,
     append_invariance_notes,
+    append_intersection_note,
     append_union_note,
     format_type,
     format_type_bare,
@@ -160,6 +161,7 @@ from mypy.typeops import (
     function_type,
     is_literal_type_like,
     is_singleton_type,
+    make_simplified_intersection,
     make_simplified_union,
     map_type_from_supertype,
     true_only,
@@ -203,6 +205,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     find_unpack_in_list,
+    flatten_nested_intersections,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
@@ -779,6 +782,21 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                         outer_type = joined_type
             else:
                 return self.extract_callable_type(union_type, ctx)
+        elif isinstance(inner_type, IntersectionType):
+            intersection_type = make_simplified_intersection(inner_type.items)
+            if isinstance(intersection_type, IntersectionType):
+                items = []
+                for item in intersection_type.items:
+                    callable_item = self.extract_callable_type(item, ctx)
+                    if callable_item is None:
+                        break
+                    items.append(callable_item)
+                else:
+                    joined_type = get_proper_type(join.join_type_list(items))
+                    if isinstance(joined_type, FunctionLike):
+                        outer_type = joined_type
+            else:
+                return self.extract_callable_type(intersection_type, ctx)
 
         if outer_type is None:
             self.msg.not_callable(inner_type, ctx)
@@ -1003,6 +1021,10 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return make_simplified_union(
                 [self.get_generator_yield_type(item, is_coroutine) for item in return_type.items]
             )
+        elif isinstance(return_type, IntersectionType):
+            return make_simplified_intersection(
+                [self.get_generator_yield_type(item, is_coroutine) for item in return_type.items]
+            )
         elif not self.is_generator_return_type(
             return_type, is_coroutine
         ) and not self.is_async_generator_return_type(return_type):
@@ -1035,6 +1057,10 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return AnyType(TypeOfAny.from_another_any, source_any=return_type)
         elif isinstance(return_type, UnionType):
             return make_simplified_union(
+                [self.get_generator_receive_type(item, is_coroutine) for item in return_type.items]
+            )
+        elif isinstance(return_type, IntersectionType):
+            return make_simplified_intersection(
                 [self.get_generator_receive_type(item, is_coroutine) for item in return_type.items]
             )
         elif not self.is_generator_return_type(
@@ -1078,6 +1104,10 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return AnyType(TypeOfAny.from_another_any, source_any=return_type)
         elif isinstance(return_type, UnionType):
             return make_simplified_union(
+                [self.get_generator_return_type(item, is_coroutine) for item in return_type.items]
+            )
+        elif isinstance(return_type, IntersectionType):
+            return make_simplified_intersection(
                 [self.get_generator_return_type(item, is_coroutine) for item in return_type.items]
             )
         elif not self.is_generator_return_type(return_type, is_coroutine):
@@ -1731,18 +1761,30 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 if opt_meta is not None:
                     forward_inst = opt_meta
 
-        def has_readable_member(typ: UnionType | Instance, name: str) -> bool:
+        def has_readable_member(typ: UnionType | IntersectionType | Instance, name: str) -> bool:
             # TODO: Deal with attributes of TupleType etc.
             if isinstance(typ, Instance):
                 return typ.type.has_readable_member(name)
-            return all(
-                (isinstance(x, UnionType) and has_readable_member(x, name))
-                or (isinstance(x, Instance) and x.type.has_readable_member(name))
-                for x in get_proper_types(typ.relevant_items())
-            )
+            if isinstance(typ, UnionType):
+                return all(
+                    (isinstance(x, UnionType) and has_readable_member(x, name))
+                    or (isinstance(x, Instance) and x.type.has_readable_member(name))
+                    for x in get_proper_types(typ.relevant_items())
+                )
+            if isinstance(typ, IntersectionType):
+                return all(
+                    (isinstance(x, IntersectionType) and has_readable_member(x, name))
+                    or (isinstance(x, Instance) and x.type.has_readable_member(name))
+                    for x in get_proper_types(typ.relevant_items())
+                )
 
         if not (
             isinstance(forward_inst, (Instance, UnionType))
+            and has_readable_member(forward_inst, forward_name)
+        ):
+            return
+        if not (
+            isinstance(forward_inst, (Instance, IntersectionType))
             and has_readable_member(forward_inst, forward_name)
         ):
             return
@@ -1807,7 +1849,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
         # Note: we do not attempt to handle unsafe overlaps related to multiple
         # inheritance. (This is consistent with how we handle overloads: we also
         # do not try checking unsafe overlaps due to multiple inheritance there.)
-
+        # TODO intersections? should we just make a single flattening function?
         for forward_item in flatten_nested_unions([forward_type]):
             forward_item = get_proper_type(forward_item)
             if isinstance(forward_item, CallableType):
@@ -2302,6 +2344,26 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             for orig_typ in original_type.items
         ):
             # This method is a subtype of at least one union variant.
+            if (
+                original_node
+                and codes.MUTABLE_OVERRIDE in self.options.enabled_error_codes
+                and self.is_writable_attribute(original_node)
+                and not always_allow_covariant
+            ):
+                # Covariant override of mutable attribute.
+                base_str, override_str = format_type_distinctly(
+                    original_type, typ, options=self.options
+                )
+                msg = message_registry.COVARIANT_OVERRIDE_OF_MUTABLE_ATTRIBUTE.with_additional_msg(
+                    f' (base class "{base.name}" defined the type as {base_str},'
+                    f" override has type {override_str})"
+                )
+                self.fail(msg, context)
+        elif isinstance(original_type, IntersectionType) and any(
+            is_subtype(typ, orig_typ, ignore_pos_arg_names=True)
+            for orig_typ in original_type.items
+        ):
+            # This method is a subtype of at least one intersection variant.
             if (
                 original_node
                 and codes.MUTABLE_OVERRIDE in self.options.enabled_error_codes
@@ -3256,6 +3318,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                             if not self.current_node_deferred:
                                 # Partial type can't be final, so strip any literal values.
                                 rvalue_type = remove_instance_last_known_values(rvalue_type)
+                                # TODO intersection?
                                 inferred_type = make_simplified_union([rvalue_type, NoneType()])
                                 self.set_inferred_type(var, lvalue, inferred_type)
                             else:
@@ -3827,6 +3890,8 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return True  # Can be a property, or some other magic
         if isinstance(typ, UnionType):
             return all(self.is_assignable_slot(lvalue, u) for u in typ.items)
+        if isinstance(typ, IntersectionType):
+            return any(self.is_assignable_slot(lvalue, u) for u in typ.items)
         return False
 
     def flatten_rvalues(self, rvalues: list[Expression]) -> list[Expression]:
@@ -4027,6 +4092,10 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             self.check_multi_assignment_from_union(
                 lvalues, rvalue, rvalue_type, context, infer_lvalue_type
             )
+        elif isinstance(rvalue_type, IntersectionType):
+            self.check_multi_assignment_from_intersection(
+                lvalues, rvalue, rvalue_type, context, infer_lvalue_type
+            )
         elif isinstance(rvalue_type, Instance) and rvalue_type.type.fullname == "builtins.str":
             self.msg.unpacking_strings_disallowed(context)
         else:
@@ -4101,6 +4170,73 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 self.store_type(lv, union)
         self.no_partial_types = False
 
+    def check_multi_assignment_from_intersection(
+        self,
+        lvalues: list[Expression],
+        rvalue: Expression,
+        rvalue_type: IntersectionType,
+        context: Context,
+        infer_lvalue_type: bool,
+    ) -> None:
+        """Check assignment to multiple lvalue targets when rvalue type is an Intersection[...].
+        For example:
+
+            t: Intersection[Tuple[int, int], Tuple[str, str]]
+            x, y = t
+            reveal_type(x)  # Intersection[int, str]
+
+        The idea in this case is to process the assignment for every item of the intersection.
+        Important note: the types are collected in two places, 'intersection_types' contains
+        inferred types for first assignments, 'assignments' contains the narrowed types
+        for binder.
+        """
+        self.no_partial_types = True
+        transposed: tuple[list[Type], ...] = tuple([] for _ in self.flatten_lvalues(lvalues))
+        # Notify binder that we want to defer bindings and instead collect types.
+        with self.binder.accumulate_type_assignments() as assignments:
+            for item in rvalue_type.items:
+                # Type check the assignment separately for each intersection item and collect
+                # the inferred lvalue types for each intersection item.
+                self.check_multi_assignment(
+                    lvalues,
+                    rvalue,
+                    context,
+                    infer_lvalue_type=infer_lvalue_type,
+                    rv_type=item,
+                    undefined_rvalue=True,
+                )
+                for t, lv in zip(transposed, self.flatten_lvalues(lvalues)):
+                    # We can access _type_maps directly since temporary type maps are
+                    # only created within expressions.
+                    t.append(self._type_maps[0].pop(lv, AnyType(TypeOfAny.special_form)))
+        intersection_types = tuple(make_simplified_intersection(col) for col in transposed)
+        for expr, items in assignments.items():
+            # Bind an Intersection of types collected in 'assignments' to every expression.
+            if isinstance(expr, StarExpr):
+                expr = expr.expr
+
+            # TODO: See comment in binder.py, ConditionalTypeBinder.assign_type
+            # It's unclear why the 'declared_type' param is sometimes 'None'
+            clean_items: list[tuple[Type, Type]] = []
+            for type, declared_type in items:
+                assert declared_type is not None
+                clean_items.append((type, declared_type))
+
+            types, declared_types = zip(*clean_items)
+            self.binder.assign_type(
+                expr,
+                make_simplified_intersection(list(types)),
+                make_simplified_intersection(list(declared_types)),
+            )
+        for intersection, lv in zip(intersection_types, self.flatten_lvalues(lvalues)):
+            # Properly store the inferred types.
+            _1, _2, inferred = self.check_lvalue(lv)
+            if inferred:
+                self.set_inferred_type(inferred, lv, intersection)
+            else:
+                self.store_type(lv, intersection)
+        self.no_partial_types = False
+
     def flatten_lvalues(self, lvalues: list[Expression]) -> list[Expression]:
         res: list[Expression] = []
         for lv in lvalues:
@@ -4149,6 +4285,11 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                         reinferred_rvalue_type = get_proper_type(relevant_items[0])
                 if isinstance(reinferred_rvalue_type, UnionType):
                     self.check_multi_assignment_from_union(
+                        lvalues, rvalue, reinferred_rvalue_type, context, infer_lvalue_type
+                    )
+                    return
+                if isinstance(reinferred_rvalue_type, IntersectionType):
+                    self.check_multi_assignment_from_intersection(
                         lvalues, rvalue, reinferred_rvalue_type, context, infer_lvalue_type
                     )
                     return
@@ -5264,6 +5405,13 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 if c_type:
                     types.append(c_type)
             return UnionType.make_union(types)
+        if isinstance(typ, IntersectionType):
+            types: list[Type] = []
+            for item in typ.items:
+                c_type = self.analyze_container_item_type(item)
+                if c_type:
+                    types.append(c_type)
+            return IntersectionType.make_intersection(types)
         if isinstance(typ, Instance) and typ.type.has_base("typing.Container"):
             supertype = self.named_type("typing.Container").type
             super_instance = map_instance_to_supertype(typ, supertype)
@@ -5839,12 +5987,12 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
         if isinstance(typ, NoneType):
             return [], [typ]
 
-        if isinstance(typ, UnionType):
+        if isinstance(typ, (UnionType, IntersectionType)):
             callables = []
             uncallables = []
             for subtype in typ.items:
-                # Use unsound_partition when handling unions in order to
-                # allow the expected type discrimination.
+                # Use unsound_partition when handling unions/intersections in
+                # order to allow the expected type discrimination.
                 subcallables, subuncallables = self.partition_by_callable(
                     subtype, unsound_partition=True
                 )
@@ -5936,7 +6084,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
         else_types: list[Type] = []
 
         iterable_type = get_proper_type(iterable_type)
-        if isinstance(iterable_type, UnionType):
+        if isinstance(iterable_type, (UnionType, IntersectionType)):
             possible_iterable_types = get_proper_types(iterable_type.relevant_items())
         else:
             possible_iterable_types = [iterable_type]
@@ -5975,7 +6123,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             )
             or isinstance(t, FunctionLike)
             or (
-                isinstance(t, UnionType)
+                isinstance(t, (UnionType, IntersectionType))
                 and all(self._is_truthy_type(t) for t in get_proper_types(t.items))
             )
         )
@@ -6023,6 +6171,8 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             self.fail(message_registry.FUNCTION_ALWAYS_TRUE.format(get_expr_name()), expr)
         elif isinstance(t, UnionType):
             self.fail(message_registry.TYPE_ALWAYS_TRUE_UNIONTYPE.format(format_expr_type()), expr)
+        elif isinstance(t, IntersectionType):
+            self.fail(message_registry.TYPE_ALWAYS_TRUE_INTERSECTIONTYPE.format(format_expr_type()), expr)
         elif isinstance(t, Instance) and t.type.fullname == "typing.Iterable":
             _, info = self.make_fake_typeinfo("typing", "Collection", "Collection", [])
             self.fail(
@@ -6657,18 +6807,22 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             if parent_type is None:
                 return output
 
-            # We currently only try refining the parent type if it's a Union.
+            # We currently only try refining the parent type if it's a Union/Intersection.
             # If not, there's no point in trying to refine any further parents
             # since we have no further information we can use to refine the lookup
             # chain, so we end early as an optimization.
             parent_type = get_proper_type(parent_type)
-            if not isinstance(parent_type, UnionType):
+            if not isinstance(parent_type, (UnionType, Intersection)):
                 return output
 
             # Take each element in the parent union and replay the original lookup procedure
             # to figure out which parents are compatible.
             new_parent_types = []
-            for item in flatten_nested_unions(parent_type.items):
+            if isinstance(parent_type, UnionType):
+                sub_items = flatten_nested_unions(parent_type.items)
+            else:
+                sub_items = flatten_nested_intersections(parent_type.items)
+            for item in sub_items:
                 member_type = replay_lookup(get_proper_type(item))
                 if member_type is None:
                     # We were unable to obtain the member type. So, we give up on refining this
@@ -6685,7 +6839,11 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 return output
 
             expr = parent_expr
-            expr_type = output[parent_expr] = make_simplified_union(new_parent_types)
+            if isinstance(parent_type, UnionType):
+                expr_type = make_simplified_union(new_parent_types)
+            else:
+                expr_type = make_simplified_intersection(new_parent_types)
+            output[parent_expr] = expr_type
 
     def refine_identity_comparison_expression(
         self,
@@ -6887,7 +7045,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
         """Is this a type that can benefit from length check type restrictions?
 
         Currently supported types are TupleTypes, Instances of builtins.tuple, and
-        unions involving such types.
+        unions/Intersections involving such types.
         """
         if custom_special_method(typ, "__len__"):
             # If user overrides builtin behavior, we can't do anything.
@@ -6901,7 +7059,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return True
         if isinstance(p_typ, Instance):
             return p_typ.type.has_base("builtins.tuple")
-        if isinstance(p_typ, UnionType):
+        if isinstance(p_typ, (UnionType, IntersectionType)):
             return any(self.can_be_narrowed_with_len(t) for t in p_typ.items)
         return False
 
@@ -7021,7 +7179,11 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return self.refine_tuple_type_with_len(typ, op, size)
         elif isinstance(typ, Instance):
             return self.refine_instance_type_with_len(typ, op, size)
-        elif isinstance(typ, UnionType):
+        elif isinstance(typ, (UnionType, IntersectionType)):
+            if isinstance(type, UnionType):
+                maker = make_simplified_union
+            else:
+                maker = make_simplified_intersection
             yes_types = []
             no_types = []
             other_types = []
@@ -7037,11 +7199,11 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             yes_types += other_types
             no_types += other_types
             if yes_types:
-                yes_type = make_simplified_union(yes_types)
+                yes_type = maker(yes_types)
             else:
                 yes_type = None
             if no_types:
-                no_type = make_simplified_union(no_types)
+                no_type = maker(no_types)
             else:
                 no_type = None
             return yes_type, no_type
@@ -7231,7 +7393,8 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 notes = append_invariance_notes(notes, subtype, supertype)
             if isinstance(subtype, UnionType) and isinstance(supertype, UnionType):
                 notes = append_union_note(notes, subtype, supertype, self.options)
-            # TODO add intersection notes
+            if isinstance(subtype, IntersectionType) and isinstance(supertype, IntersectionType):
+                notes = append_intersection_note(notes, subtype, supertype, self.options)
         if extra_info:
             msg = msg.with_additional_msg(" (" + ", ".join(extra_info) + ")")
 
@@ -7636,6 +7799,16 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                     # if we reach here, we refuse to do any type inference.
                     return {}, {}
             vartype = UnionType(union_list)
+        if isinstance(vartype, IntersectionType):
+            intersection_list = []
+            for t in get_proper_types(vartype.items):
+                if isinstance(t, TypeType):
+                    intersection_list.append(t.item)
+                else:
+                    # This is an error that should be reported earlier
+                    # if we reach here, we refuse to do any type inference.
+                    return {}, {}
+            vartype = IntersectionType(intersection_list)
         elif isinstance(vartype, TypeType):
             vartype = vartype.item
         elif isinstance(vartype, Instance) and vartype.type.is_metaclass():
@@ -7684,7 +7857,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
         # computing it again using a different algorithm that tries to generate
         # an ad-hoc intersection between the expr_type and the type_ranges.
         proper_type = get_proper_type(expr_type)
-        if isinstance(proper_type, UnionType):
+        if isinstance(proper_type, (UnionType, IntersectionType)):
             possible_expr_types = get_proper_types(proper_type.relevant_items())
         else:
             possible_expr_types = [proper_type]
@@ -7763,6 +7936,8 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 types.append(TypeRange(object_type, is_upper_bound=True))
             elif isinstance(typ, Instance) and typ.type.fullname == "types.UnionType" and typ.args:
                 types.append(TypeRange(UnionType(typ.args), is_upper_bound=False))
+            elif isinstance(typ, Instance) and typ.type.fullname == "types.IntersectionType" and typ.args:
+                types.append(TypeRange(IntersectionType(typ.args), is_upper_bound=False))
             elif isinstance(typ, AnyType):
                 types.append(TypeRange(typ, is_upper_bound=False))
             else:  # we didn't see an actual type, but rather a variable with unknown value
@@ -7843,6 +8018,11 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             return make_simplified_union(
                 with_attr + [self.add_any_attribute_to_type(typ, name) for typ in without_attr]
             )
+        if isinstance(typ, IntersectionType):
+            with_attr, without_attr = self.partition_intersection_by_attr(typ, name)
+            return make_simplified_intersection(
+                with_attr + [self.add_any_attribute_to_type(typ, name) for typ in without_attr]
+            )
         return orig_typ
 
     def hasattr_type_maps(
@@ -7864,6 +8044,10 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
             _, without_attr = self.partition_union_by_attr(source_type, name)
             yes_map = {expr: self.add_any_attribute_to_type(source_type, name)}
             return yes_map, {expr: make_simplified_union(without_attr)}
+        if isinstance(source_type, IntersectionType):
+            _, without_attr = self.partition_intersection_by_attr(source_type, name)
+            yes_map = {expr: self.add_any_attribute_to_type(source_type, name)}
+            return yes_map, {expr: make_simplified_intersection(without_attr)}
 
         type_with_attr = self.add_any_attribute_to_type(source_type, name)
         if type_with_attr != source_type:
@@ -7872,6 +8056,18 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
 
     def partition_union_by_attr(
         self, source_type: UnionType, name: str
+    ) -> tuple[list[Type], list[Type]]:
+        with_attr = []
+        without_attr = []
+        for item in source_type.items:
+            if self.has_valid_attribute(item, name):
+                with_attr.append(item)
+            else:
+                without_attr.append(item)
+        return with_attr, without_attr
+
+    def partition_intersection_by_attr(
+        self, source_type: IntersectionType, name: str
     ) -> tuple[list[Type], list[Type]]:
         with_attr = []
         without_attr = []
@@ -8238,6 +8434,8 @@ def reduce_conditional_maps(
     ...where "PseudoIntersection[X, Y] == Y" because mypy actually doesn't understand intersections
     yet, so we settle for just arbitrarily picking the right expr's type.
 
+    TODO but!
+
     We only retain the shared expression in the 'else' case because we don't actually know
     whether x was refined or y was refined -- only just that one of the two was refined.
     """
@@ -8248,6 +8446,7 @@ def reduce_conditional_maps(
     else:
         final_if_map, final_else_map = type_maps[0]
         for if_map, else_map in type_maps[1:]:
+            # TODO and_conditional_maps should return Intersections in its values?
             final_if_map = and_conditional_maps(final_if_map, if_map, use_meet=use_meet)
             final_else_map = or_conditional_maps(final_else_map, else_map)
 
@@ -8263,7 +8462,7 @@ def convert_to_typetype(type_map: TypeMap) -> TypeMap:
         if isinstance(t, TypeVarType):
             t = t.upper_bound
         # TODO: should we only allow unions of instances as per PEP 484?
-        if not isinstance(get_proper_type(t), (UnionType, Instance, NoneType)):
+        if not isinstance(get_proper_type(t), (UnionType, IntersectionType, Instance, NoneType)):
             # unknown type; error was likely reported earlier
             return {}
         converted_type_map[expr] = TypeType.make_normalized(typ)
@@ -9118,7 +9317,7 @@ def _ambiguous_enum_variants(types: list[Type]) -> set[str]:
     result = set()
     for t in types:
         t = get_proper_type(t)
-        if isinstance(t, UnionType):
+        if isinstance(t, (UnionType, IntersectionType)):
             result.update(_ambiguous_enum_variants(t.items))
         elif isinstance(t, Instance):
             if t.last_known_value:

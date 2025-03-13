@@ -3943,7 +3943,6 @@ def type_vars_as_args(type_vars: Sequence[TypeVarLikeType]) -> tuple[Type, ...]:
             args.append(tv)
     return tuple(args)
 
-
 # This cyclic import is unfortunate, but to avoid it we would need to move away all uses
 # of get_proper_type() from types.py. Majority of them have been removed, but few remaining
 # are quite tricky to get rid of, but ultimately we want to do it at some point.
