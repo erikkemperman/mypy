@@ -81,6 +81,9 @@ METHOD_ASSIGN: Final[ErrorCode] = ErrorCode(
 )
 TYPE_ARG: Final = ErrorCode("type-arg", "Check that generic type arguments are present", "General")
 TYPE_VAR: Final = ErrorCode("type-var", "Check that type variable values are valid", "General")
+INTERSECTION_ATTR: Final = ErrorCode(
+    "intersection-attr", "Check that attribute exists in each item of an intersection", "General"
+)
 UNION_ATTR: Final = ErrorCode(
     "union-attr", "Check that attribute exists in each item of a union", "General"
 )

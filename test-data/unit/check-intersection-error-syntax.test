@@ -1,0 +1,67 @@
+[case testIntersectionErrorSyntax]
+# TODO add --python-version 3.XY hopefully sometime
+# flags: --python-version 3.13 --no-force-intersection-syntax
+from typing import Intersection
+x : Intersection[bool, str]
+x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool & str")
+
+[case testIntersectionOrErrorSyntax]
+# flags: --python-version 3.13 --force-intersection-syntax
+from typing import Intersection
+x : Intersection[bool, str]
+x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "Intersection[bool, str]")
+
+[case testIntersectionAndNoneErrorSyntax]
+# flags: --python-version 3.13 --no-force-intersection-syntax
+## TODO define how to handle None
+from typing import Intersection
+x : Intersection[bool, None]
+x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool & None")
+
+[case testIntersectionForceNoneError2Syntax]
+# flags: --python-version 3.13 --force-intersection-syntax
+## TODO define how to handle None
+from typing import Intersection
+x : Intersection[bool, None]
+x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "Intersection[bool, None]")
+
+[case testIntersectionNoneAsFinalItem]
+# flags: --python-version 3.13 --no-force-intersection-syntax
+## TODO define how to handle None
+from typing import Intersection
+x : Intersection[bool, None, str]
+x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool & str & None")
+
+[case testIntersectionLiteralAndErrorSyntax]
+# flags: --python-version 3.13 --no-force-intersection-syntax
+## TODO define how to handle Literals
+from typing import Literal, Intersection
+x : Intersection[Literal[1], Literal[2], str]
+x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Literal[1, 2] & str")
+[builtins fixtures/tuple.pyi]
+
+[case testIntersectionForceIntersectionErrorSyntax]
+# flags: --python-version 3.13 --force-intersection-syntax
+## TODO define how to handle Literals
+from typing import Literal, Intersection
+x : Intersection[Literal[1], Literal[2], str]
+x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Intersection[str, Literal[1, 2]]")
+[builtins fixtures/tuple.pyi]
+
+[case testIntersectionLiteralAndNoneErrorSyntax]
+# flags: --python-version 3.13 --no-force-intersection-syntax
+## TODO define how to handle Literals
+## TODO define how to handle None
+from typing import Literal, Intersection
+x : Intersection[Literal[1], None]
+x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Literal[1] & None")
+[builtins fixtures/tuple.pyi]
+
+[case testIntersectionForceLiteralNoneErrorSyntax]
+# flags: --python-version 3.13 --force-intersection-syntax
+## TODO define how to handle Literals
+## TODO define how to handle None
+from typing import Literal, Intersection
+x : Intersection[Literal[1], None]
+x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Intersection[Literal[1], None]")
+[builtins fixtures/tuple.pyi]

@@ -16,6 +16,7 @@ from mypy.types import (
     AnyType,
     CallableType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -28,6 +29,7 @@ from mypy.types import (
     TypeVarType,
     UnionType,
     UnpackType,
+    flatten_nested_intersections,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
@@ -66,9 +68,9 @@ def is_invalid_recursive_alias(seen_nodes: set[TypeAlias], target: Type) -> bool
         assert target.alias, f"Unfixed type alias {target.type_ref}"
         return is_invalid_recursive_alias(seen_nodes | {target.alias}, get_proper_type(target))
     assert isinstance(target, ProperType)
-    if not isinstance(target, (UnionType, TupleType)):
+    if not isinstance(target, (UnionType, IntersectionType, TupleType)):
         return False
-    if isinstance(target, UnionType):
+    if isinstance(target, (UnionType, IntersectionType)):
         return any(is_invalid_recursive_alias(seen_nodes, item) for item in target.items)
     for item in target.items:
         if isinstance(item, UnpackType):
@@ -103,6 +105,17 @@ def get_bad_type_type_item(item: Type) -> str | None:
         if len(items) == 1:
             return items[0]
         return f"Union[{', '.join(items)}]"
+    if isinstance(item, IntersectionType):
+        items = [
+            bad_item
+            for typ in flatten_nested_intersections(item.items)
+            if (bad_item := get_bad_type_type_item(typ)) is not None
+        ]
+        if not items:
+            return None
+        if len(items) == 1:
+            return items[0]
+        return f"Intersection[{', '.join(items)}]"
     return None
 
 

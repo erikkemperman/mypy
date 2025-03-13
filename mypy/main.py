@@ -779,6 +779,9 @@ def process_options(
     add_invertible_flag(
         "--force-union-syntax", default=False, help=argparse.SUPPRESS, group=none_group
     )
+    add_invertible_flag(
+        "--force-intersection-syntax", default=False, help=argparse.SUPPRESS, group=none_group
+    )
 
     lint_group = parser.add_argument_group(
         title="Configuring warnings",

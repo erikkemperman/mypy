@@ -274,6 +274,7 @@ from mypy.types import (
     CallableType,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,

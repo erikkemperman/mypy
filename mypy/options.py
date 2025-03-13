@@ -396,6 +396,7 @@ class Options:
         self.disable_bytearray_promotion = False
         self.disable_memoryview_promotion = False
         self.force_uppercase_builtins = False
+        self.force_intersection_syntax = False
         self.force_union_syntax = False
 
         # Sets custom output format
@@ -404,6 +405,12 @@ class Options:
     def use_lowercase_names(self) -> bool:
         if self.python_version >= (3, 9):
             return not self.force_uppercase_builtins
+        return False
+
+    def use_and_syntax(self) -> bool:
+        # TODO actual version
+        if self.python_version >= (3, 13):
+            return not self.force_intersection_syntax
         return False
 
     def use_or_syntax(self) -> bool:

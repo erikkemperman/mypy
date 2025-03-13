@@ -890,6 +890,11 @@ in error messages.
     in error messages (instead of the ``|`` operator),
     even on Python 3.10+.
 
+.. option:: --force-intersection-syntax
+
+    Always use ``Interection[]`` for intersection types
+    in error messages (instead of the ``&`` operator),
+    even on Python 3.XYZ+.
 
 .. _incremental:
 

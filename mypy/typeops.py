@@ -38,6 +38,7 @@ from mypy.types import (
     FormalArgument,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     NormalizedCallableType,
@@ -59,6 +60,7 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    flatten_nested_intersections,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
@@ -75,7 +77,7 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
     """
     if isinstance(s, TypeAliasType) and s.is_recursive:
         return (
-            isinstance(get_proper_type(t), (Instance, UnionType))
+            isinstance(get_proper_type(t), (Instance, UnionType, IntersectionType))
             or isinstance(t, TypeAliasType)
             and t.is_recursive
             # Tuple types are special, they can cause an infinite recursion even if
@@ -85,7 +87,7 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
         )
     if isinstance(t, TypeAliasType) and t.is_recursive:
         return (
-            isinstance(get_proper_type(s), (Instance, UnionType))
+            isinstance(get_proper_type(s), (Instance, UnionType, IntersectionType))
             or isinstance(s, TypeAliasType)
             and s.is_recursive
             # Same as above.
@@ -493,6 +495,83 @@ def is_simple_literal(t: ProperType) -> bool:
     return False
 
 
+def make_simplified_intersection(
+    items: Sequence[Type],
+    line: int = -1,
+    column: int = -1,
+    *,
+    keep_erased: bool = False,
+    contract_literals: bool = True,
+    handle_recursive: bool = True,
+) -> ProperType:
+    """Build intersection type with redundant intersection items removed.
+
+    If only a single item remains, this may return a non-intersection type.
+
+    Examples:
+
+    * [int, str] -> Intersection[int, str]
+    * [int, object] -> object
+    * [int, int] -> int
+    * [int, Any] -> Intersection[int, Any] (Any types are not simplified away!)
+    * [Any, Any] -> Any
+    * [int, Intersection[bytes, str]] -> Intersection[int, bytes, str]
+
+    Note: This must NOT be used during semantic analysis, since TypeInfos may not
+          be fully initialized.
+
+    The keep_erased flag is used for type inference against intersection types
+    containing type variables. If set to True, keep all ErasedType items.
+
+    The contract_literals flag indicates whether we need to contract literal types
+    back into a sum type. Set it to False when called by try_expanding_sum_type_
+    to_union().
+    ## TODO grok this last bit
+    """
+    # Step 1: expand all nested unions
+    items = flatten_nested_intersections(items, handle_recursive=handle_recursive)
+
+    # Step 2: fast path for single item
+    if len(items) == 1:
+        return get_proper_type(items[0])
+
+    # Step 3: remove redundant unions
+    simplified_set: Sequence[Type] = _remove_redundant_intersection_items(items, keep_erased)
+
+    # Step 4: If more than one literal exists in the union, try to simplify
+    if (
+        contract_literals
+        and sum(isinstance(get_proper_type(item), LiteralType) for item in simplified_set) > 1
+    ):
+        simplified_set = try_contracting_literals_in_intersection(simplified_set)
+
+    result = get_proper_type(IntersectionType.make_intersection(simplified_set, line, column))
+
+    nitems = len(items)
+    if nitems > 1 and (
+        nitems > 2 or not (type(items[0]) is NoneType or type(items[1]) is NoneType)
+    ):
+        # Step 5: At last, we erase any (inconsistent) extra attributes on instances.
+
+        # Initialize with None instead of an empty set as a micro-optimization. The set
+        # is needed very rarely, so we try to avoid constructing it.
+        extra_attrs_set: set[ExtraAttrs] | None = None
+        for item in items:
+            instance = try_getting_instance_fallback(item)
+            if instance and instance.extra_attrs:
+                if extra_attrs_set is None:
+                    extra_attrs_set = {instance.extra_attrs}
+                else:
+                    extra_attrs_set.add(instance.extra_attrs)
+
+        if extra_attrs_set is not None and len(extra_attrs_set) > 1:
+            fallback = try_getting_instance_fallback(result)
+            if fallback:
+                fallback.extra_attrs = None
+
+    return result
+
+
 def make_simplified_union(
     items: Sequence[Type],
     line: int = -1,
@@ -567,6 +646,85 @@ def make_simplified_union(
                 fallback.extra_attrs = None
 
     return result
+
+
+def _remove_redundant_intersection_items(items: list[Type], keep_erased: bool) -> list[Type]:
+    from mypy.subtypes import is_proper_subtype
+
+    # The first pass through this loop, we check if later items are subtypes of earlier items.
+    # The second pass through this loop, we check if earlier items are subtypes of later items
+    # (by reversing the remaining items)
+    for _direction in range(2):
+        new_items: list[Type] = []
+        # seen is a map from a type to its index in new_items
+        seen: dict[ProperType, int] = {}
+        unduplicated_literal_fallbacks: set[Instance] | None = None
+        for ti in items:
+            proper_ti = get_proper_type(ti)
+
+            # UninhabitedType is always redundant
+            if isinstance(proper_ti, UninhabitedType):
+                continue
+
+            duplicate_index = -1
+            # Quickly check if we've seen this type
+            if proper_ti in seen:
+                duplicate_index = seen[proper_ti]
+            elif (
+                isinstance(proper_ti, LiteralType)
+                and unduplicated_literal_fallbacks is not None
+                and proper_ti.fallback in unduplicated_literal_fallbacks
+            ):
+                # This is an optimisation for intersections with many LiteralType
+                # We've already checked for exact duplicates. This means that any super type of
+                # the LiteralType must be a super type of its fallback. If we've gone through
+                # the expensive loop below and found no super type for a previous LiteralType
+                # with the same fallback, we can skip doing that work again and just add the type
+                # to new_items
+                pass
+            else:
+                # If not, check if we've seen a supertype of this type
+                for j, tj in enumerate(new_items):
+                    tj = get_proper_type(tj)
+                    # If tj is an Instance with a last_known_value, do not remove proper_ti
+                    # (unless it's an instance with the same last_known_value)
+                    if (
+                        isinstance(tj, Instance)
+                        and tj.last_known_value is not None
+                        and not (
+                            isinstance(proper_ti, Instance)
+                            and tj.last_known_value == proper_ti.last_known_value
+                        )
+                    ):
+                        continue
+
+                    if is_proper_subtype(
+                        tj, ti, keep_erased_types=keep_erased, ignore_promotions=True
+                    ):
+                        duplicate_index = j
+                        break
+            if duplicate_index != -1:
+                # If deleted subtypes had more general truthiness, use that
+                orig_item = new_items[duplicate_index]
+                if not orig_item.can_be_true and ti.can_be_true:
+                    new_items[duplicate_index] = true_or_false(orig_item)
+                elif not orig_item.can_be_false and ti.can_be_false:
+                    new_items[duplicate_index] = true_or_false(orig_item)
+            else:
+                # We have a non-duplicate item, add it to new_items
+                seen[proper_ti] = len(new_items)
+                new_items.append(ti)
+                if isinstance(proper_ti, LiteralType):
+                    if unduplicated_literal_fallbacks is None:
+                        unduplicated_literal_fallbacks = set()
+                    unduplicated_literal_fallbacks.add(proper_ti.fallback)
+
+        items = new_items
+        if len(items) <= 1:
+            break
+        items.reverse()
+
+    return items
 
 
 def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[Type]:
@@ -681,6 +839,12 @@ def true_only(t: Type) -> ProperType:
         new_items = [true_only(item) for item in t.items]
         can_be_true_items = [item for item in new_items if item.can_be_true]
         return make_simplified_union(can_be_true_items, line=t.line, column=t.column)
+    elif isinstance(t, IntersectionType):
+        # The true version of an intersection type is the intersection of the true versions of its components
+        new_items = [true_only(item) for item in t.items]
+        can_be_true_items = [item for item in new_items if item.can_be_true]
+        return make_simplified_intersection(can_be_true_items, line=t.line,
+                                     column=t.column)
     else:
         ret_type = _get_type_method_ret_type(t, name="__bool__") or _get_type_method_ret_type(
             t, name="__len__"
@@ -716,6 +880,12 @@ def false_only(t: Type) -> ProperType:
         new_items = [false_only(item) for item in t.items]
         can_be_false_items = [item for item in new_items if item.can_be_false]
         return make_simplified_union(can_be_false_items, line=t.line, column=t.column)
+    elif isinstance(t, IntersectionType):
+        # The false version of an intersection type is the intersection of the false versions of its components
+        new_items = [false_only(item) for item in t.items]
+        can_be_false_items = [item for item in new_items if item.can_be_false]
+        return make_simplified_intersection(can_be_false_items, line=t.line,
+                                     column=t.column)
     elif isinstance(t, Instance) and t.type.fullname in ("builtins.str", "builtins.bytes"):
         return LiteralType("", fallback=t)
     elif isinstance(t, Instance) and t.type.fullname == "builtins.int":
@@ -748,6 +918,10 @@ def true_or_false(t: Type) -> ProperType:
     if isinstance(t, UnionType):
         new_items = [true_or_false(item) for item in t.items]
         return make_simplified_union(new_items, line=t.line, column=t.column)
+
+    if isinstance(t, IntersectionType):
+        new_items = [true_or_false(item) for item in t.items]
+        return make_simplified_intersection(new_items, line=t.line, column=t.column)
 
     new_t = copy_type(t)
     new_t.can_be_true = new_t.can_be_true_default()
@@ -837,6 +1011,7 @@ def try_getting_str_literals(expr: Expression, typ: Type) -> list[str] | None:
     1. 'expr' is a StrExpr
     2. 'typ' is a LiteralType containing a string
     3. 'typ' is a UnionType containing only LiteralType of strings
+    4. 'typ' is an IntersectionType containing only LiteralType of strings
     """
     if isinstance(expr, StrExpr):
         return [expr.value]
@@ -882,7 +1057,7 @@ def try_getting_literals_from_type(
 
     if isinstance(typ, Instance) and typ.last_known_value is not None:
         possible_literals: list[Type] = [typ.last_known_value]
-    elif isinstance(typ, UnionType):
+    elif isinstance(typ, (UnionType, IntersectionType)):
         possible_literals = list(typ.items)
     else:
         possible_literals = [typ]
@@ -909,7 +1084,7 @@ def is_literal_type_like(t: Type | None) -> bool:
         return False
     elif isinstance(t, LiteralType):
         return True
-    elif isinstance(t, UnionType):
+    elif isinstance(t, (UnionType, IntersectionType)):
         return any(is_literal_type_like(item) for item in t.items)
     elif isinstance(t, TypeVarType):
         return is_literal_type_like(t.upper_bound) or any(
@@ -937,6 +1112,47 @@ def is_singleton_type(typ: Type) -> bool:
     """
     typ = get_proper_type(typ)
     return typ.is_singleton_type()
+
+
+def try_expanding_sum_type_to_intersection(typ: Type, target_fullname: str) -> ProperType:
+    """Attempts to recursively expand any enum Instances with the given target_fullname
+    into a Union of all of its component LiteralTypes.
+
+    For example, if we have:
+
+        class Color(Enum):
+            RED = 1
+            BLUE = 2
+            YELLOW = 3
+
+        class Status(Enum):
+            SUCCESS = 1
+            FAILURE = 2
+            UNKNOWN = 3
+
+    ...and if we call `try_expanding_sum_type_to_intersection(Intersection[Color, Status], 'module.Color')`,
+    this function will return Literal[Color.RED, Color.BLUE, Color.YELLOW, Status].
+    """
+    typ = get_proper_type(typ)
+
+    if isinstance(typ, IntersectionType):
+        items = [
+            try_expanding_sum_type_to_intersection(item, target_fullname) for item in typ.relevant_items()
+        ]
+        return make_simplified_intersection(items, contract_literals=False)
+
+    if isinstance(typ, Instance) and typ.type.fullname == target_fullname:
+        if typ.type.fullname == "builtins.bool":
+            items = [LiteralType(True, typ), LiteralType(False, typ)]
+            return make_simplified_intersection(items, contract_literals=False)
+
+        if typ.type.is_enum:
+            items = [LiteralType(name, typ) for name in typ.type.enum_members]
+            if not items:
+                return typ
+            return make_simplified_intersection(items, contract_literals=False)
+
+    return typ
 
 
 def try_expanding_sum_type_to_union(typ: Type, target_fullname: str) -> ProperType:
@@ -978,6 +1194,47 @@ def try_expanding_sum_type_to_union(typ: Type, target_fullname: str) -> ProperTy
             return make_simplified_union(items, contract_literals=False)
 
     return typ
+
+
+def try_contracting_literals_in_intersection(types: Sequence[Type]) -> list[ProperType]:
+    """Contracts any literal types back into a sum type if possible.
+
+    Will replace the first instance of the literal with the sum type and
+    remove all others.
+
+    If we call `try_contracting_literals_in_intersection(Literal[Color.RED, Color.BLUE, Color.YELLOW])`,
+    this function will return Color.
+
+    We also treat `Literal[True, False]` as `bool`.
+    """
+    proper_types = [get_proper_type(typ) for typ in types]
+    sum_types: dict[str, tuple[set[Any], list[int]]] = {}
+    marked_for_deletion = set()
+    for idx, typ in enumerate(proper_types):
+        if isinstance(typ, LiteralType):
+            fullname = typ.fallback.type.fullname
+            if typ.fallback.type.is_enum or isinstance(typ.value, bool):
+                if fullname not in sum_types:
+                    sum_types[fullname] = (
+                        (
+                            set(typ.fallback.type.enum_members)
+                            if typ.fallback.type.is_enum
+                            else {True, False}
+                        ),
+                        [],
+                    )
+                literals, indexes = sum_types[fullname]
+                literals.discard(typ.value)
+                indexes.append(idx)
+                if not literals:
+                    first, *rest = indexes
+                    proper_types[first] = typ.fallback
+                    marked_for_deletion |= set(rest)
+    return list(
+        itertools.compress(
+            proper_types, [(i not in marked_for_deletion) for i in range(len(proper_types))]
+        )
+    )
 
 
 def try_contracting_literals_in_union(types: Sequence[Type]) -> list[ProperType]:
@@ -1030,6 +1287,9 @@ def coerce_to_literal(typ: Type) -> Type:
     if isinstance(typ, UnionType):
         new_items = [coerce_to_literal(item) for item in typ.items]
         return UnionType.make_union(new_items)
+    elif isinstance(typ, IntersectionType):
+        new_items = [coerce_to_literal(item) for item in typ.items]
+        return IntersectionType.make_intersection(new_items)
     elif isinstance(typ, Instance):
         if typ.last_known_value:
             return typ.last_known_value
@@ -1082,7 +1342,7 @@ def custom_special_method(typ: Type, name: str, check_all: bool = False) -> bool
             if method.node.info:
                 return not method.node.info.fullname.startswith(("builtins.", "typing."))
         return False
-    if isinstance(typ, UnionType):
+    if isinstance(typ, (UnionType, IntersectionType)):
         if check_all:
             return all(custom_special_method(t, name, check_all) for t in typ.items)
         return any(custom_special_method(t, name) for t in typ.items)
@@ -1096,6 +1356,21 @@ def custom_special_method(typ: Type, name: str, check_all: bool = False) -> bool
         return True
     # TODO: support other types (see ExpressionChecker.has_member())?
     return False
+
+
+def separate_intersection_literals(t: IntersectionType) -> tuple[Sequence[LiteralType], Sequence[Type]]:
+    """Separate literals from other members in an intersection type."""
+    literal_items = []
+    intersection_items = []
+
+    for item in t.items:
+        proper = get_proper_type(item)
+        if isinstance(proper, LiteralType):
+            literal_items.append(proper)
+        else:
+            intersection_items.append(item)
+
+    return literal_items, intersection_items
 
 
 def separate_union_literals(t: UnionType) -> tuple[Sequence[LiteralType], Sequence[Type]]:

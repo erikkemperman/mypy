@@ -124,6 +124,9 @@ class TypeIndirectionVisitor(TypeVisitor[None]):
     def visit_union_type(self, t: types.UnionType) -> None:
         self._visit(t.items)
 
+    def visit_intersection_type(self, t: types.IntersectionType) -> None:
+        self._visit(t.items)
+
     def visit_partial_type(self, t: types.PartialType) -> None:
         pass
 

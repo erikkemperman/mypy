@@ -10,6 +10,7 @@ from typing import (
     Any,
     ClassVar,
     Final,
+    Intersection,
     NamedTuple,
     NewType,
     TypeVar,
@@ -2932,9 +2933,9 @@ class UnionType(ProperType):
         self.is_evaluated = is_evaluated
         # uses_pep604_syntax is True if Union uses OR syntax (X | Y)
         self.uses_pep604_syntax = uses_pep604_syntax
-        # The meaning of these two is the same as for UnboundType. A UnionType can be
-        # return by type parser from a string "A|B", and we need to be able to fall back
-        # to plain string, when such a string appears inside a Literal[...].
+        # The meaning of these two is the same as for UnboundType. A UnionType can
+        # be returned by type parser from a string "A|B", and we need to be able to
+        # fall back to plain string, when such a string appears inside a Literal[...].
         self.original_str_expr: str | None = None
         self.original_str_fallback: str | None = None
 
@@ -2995,6 +2996,104 @@ class UnionType(ProperType):
     def deserialize(cls, data: JsonDict) -> UnionType:
         assert data[".class"] == "UnionType"
         return UnionType(
+            [deserialize_type(t) for t in data["items"]],
+            uses_pep604_syntax=data["uses_pep604_syntax"],
+        )
+
+
+class IntersectionType(ProperType):
+    """The intersection type Intersection[T1, ..., Tn] (at least one type argument)."""
+
+    __slots__ = (
+        "items",
+        "is_evaluated",
+        "uses_pep604_syntax",
+        "original_str_expr",
+        "original_str_fallback",
+    )
+
+    def __init__(
+        self,
+        items: Sequence[Type],
+        line: int = -1,
+        column: int = -1,
+        *,
+        is_evaluated: bool = True,
+        uses_pep604_syntax: bool = False,
+    ) -> None:
+        super().__init__(line, column)
+        # We must keep this false to avoid crashes during semantic analysis.
+        # TODO: maybe switch this to True during type-checking pass?
+        self.items = flatten_nested_intersections(items, handle_type_alias_type=False)
+        # is_evaluated should be set to false for type comments and string literals
+        self.is_evaluated = is_evaluated
+        # uses_pep604_syntax is True if Union uses AND syntax (X & Y)
+        self.uses_pep604_syntax = uses_pep604_syntax
+        # The meaning of these two is the same as for UnboundType. An IntersectionType
+        # can be returned by type parser from a string "A&B", and we need to be able to
+        # fall back to plain string, when such a string appears inside a Literal[...].
+        self.original_str_expr: str | None = None
+        self.original_str_fallback: str | None = None
+
+    def can_be_true_default(self) -> bool:
+        return any(item.can_be_true for item in self.items)
+
+    def can_be_false_default(self) -> bool:
+        return any(item.can_be_false for item in self.items)
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self.items))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, IntersectionType):
+            return NotImplemented
+        return frozenset(self.items) == frozenset(other.items)
+
+    @overload
+    @staticmethod
+    def make_intersection(
+        items: Sequence[ProperType], line: int = -1, column: int = -1
+    ) -> ProperType: ...
+
+    @overload
+    @staticmethod
+    def make_intersection(items: Sequence[Type], line: int = -1, column: int = -1) -> Type: ...
+
+    @staticmethod
+    def make_intersection(items: Sequence[Type], line: int = -1, column: int = -1) -> Type:
+        if len(items) > 1:
+            return IntersectionType(items, line, column)
+        elif len(items) == 1:
+            return items[0]
+        else:
+            return UninhabitedType()
+
+    def length(self) -> int:
+        return len(self.items)
+
+    def accept(self, visitor: TypeVisitor[T]) -> T:
+        return visitor.visit_intersection_type(self)
+
+    def relevant_items(self) -> list[Type]:
+        """Removes NoneTypes from Unions when strict Optional checking is off."""
+        # TODO define how to handle None in intersection
+        return self.items
+        # if state.strict_optional:
+        #     return self.items
+        # else:
+        #     return [i for i in self.items if not isinstance(get_proper_type(i), NoneType)]
+
+    def serialize(self) -> JsonDict:
+        return {
+            ".class": "IntersectionType",
+            "items": [t.serialize() for t in self.items],
+            "uses_pep604_syntax": self.uses_pep604_syntax,
+        }
+
+    @classmethod
+    def deserialize(cls, data: JsonDict) -> IntersectionType:
+        assert data[".class"] == "IntersectionType"
+        return IntersectionType(
             [deserialize_type(t) for t in data["items"]],
             uses_pep604_syntax=data["uses_pep604_syntax"],
         )
@@ -3111,6 +3210,12 @@ class TypeType(ProperType):
         if isinstance(item, UnionType):
             return UnionType.make_union(
                 [TypeType.make_normalized(union_item) for union_item in item.items],
+                line=line,
+                column=column,
+            )
+        if isinstance(item, IntersectionType):
+            return IntersectionType.make_intersection(
+                [TypeType.make_normalized(intersection_item) for intersection_item in item.items],
                 line=line,
                 column=column,
             )
@@ -3488,6 +3593,10 @@ class TypeStrVisitor(SyntheticTypeVisitor[str]):
     def visit_literal_type(self, t: LiteralType, /) -> str:
         return f"Literal[{t.value_repr()}]"
 
+    def visit_intersection_type(self, t: IntersectionType, /) -> str:
+        s = self.list_str(t.items)
+        return f"Intersection[{s}]"
+
     def visit_union_type(self, t: UnionType, /) -> str:
         s = self.list_str(t.items)
         return f"Union[{s}]"
@@ -3712,6 +3821,38 @@ def flatten_nested_unions(
     return flat_items
 
 
+def flatten_nested_intersections(
+    types: Sequence[Type], *, handle_type_alias_type: bool = True, handle_recursive: bool = True
+) -> list[Type]:
+    """Flatten nested intersections in a type list."""
+    if not isinstance(types, list):
+        typelist = list(types)
+    else:
+        typelist = cast("list[Type]", types)
+
+    # Fast path: most of the time there is nothing to flatten
+    if not any(isinstance(t, (TypeAliasType, IntersectionType)) for t in typelist):  # type: ignore[misc]
+        return typelist
+
+    flat_items: list[Type] = []
+    for t in typelist:
+        if handle_type_alias_type:
+            if not handle_recursive and isinstance(t, TypeAliasType) and t.is_recursive:
+                tp: Type = t
+            else:
+                tp = get_proper_type(t)
+        else:
+            tp = t
+        if isinstance(tp, ProperType) and isinstance(tp, IntersectionType):
+            flat_items.extend(
+                flatten_nested_intersections(tp.items, handle_type_alias_type=handle_type_alias_type)
+            )
+        else:
+            # Must preserve original aliases when possible.
+            flat_items.append(t)
+    return flat_items
+
+
 def find_unpack_in_list(items: Sequence[Type]) -> int | None:
     unpack_index: int | None = None
     for i, item in enumerate(items):
@@ -3810,6 +3951,18 @@ from mypy.expandtype import ExpandTypeVisitor
 
 
 class InstantiateAliasVisitor(ExpandTypeVisitor):
+
+    def visit_intersection_type(self, t: IntersectionType) -> Type:
+        # Unlike regular expand_type(), we don't do any simplification for intersections,
+        # not even removing strict duplicates. There are three reasons for this:
+        #   * get_proper_type() is a very hot function, even slightest slow down will
+        #     cause a perf regression
+        #   * We want to preserve this historical behaviour, to avoid possible
+        #     regressions
+        #   * Simplifying intersections may (indirectly) call get_proper_type(), causing
+        #     infinite recursion.
+        return TypeTranslator.visit_intersection_type(self, t)
+
     def visit_union_type(self, t: UnionType) -> Type:
         # Unlike regular expand_type(), we don't do any simplification for unions,
         # not even removing strict duplicates. There are three reasons for this:

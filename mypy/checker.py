@@ -180,6 +180,7 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -4525,7 +4526,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 rvalue, lvalue_type, always_allow_any=always_allow_any
             )
             if (
-                isinstance(get_proper_type(lvalue_type), UnionType)
+                isinstance(get_proper_type(lvalue_type), (UnionType, IntersectionType))
                 # Skip literal types, as they have special logic (for better errors).
                 and not is_literal_type_like(rvalue_type)
                 and not self.simple_rvalue(rvalue)
@@ -7230,6 +7231,7 @@ class TypeChecker(NodeVisitor[None], CheckerPluginInterface):
                 notes = append_invariance_notes(notes, subtype, supertype)
             if isinstance(subtype, UnionType) and isinstance(supertype, UnionType):
                 notes = append_union_note(notes, subtype, supertype, self.options)
+            # TODO add intersection notes
         if extra_info:
             msg = msg.with_additional_msg(" (" + ", ".join(extra_info) + ")")
 

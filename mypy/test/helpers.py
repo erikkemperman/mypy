@@ -354,6 +354,7 @@ def parse_options(
         options.error_summary = False
         options.hide_error_codes = True
         options.force_uppercase_builtins = True
+        options.force_intersection_syntax = True
         options.force_union_syntax = True
 
     # Allow custom python version to override testfile_pyversion.

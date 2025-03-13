@@ -4,52 +4,52 @@ from typing import Union
 x : Union[bool, str]
 x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool | str")
 
-[case testOrErrorSyntax]
+[case testUnionOrErrorSyntax]
 # flags: --python-version 3.10 --force-union-syntax
 from typing import Union
 x : Union[bool, str]
 x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "Union[bool, str]")
 
-[case testOrNoneErrorSyntax]
+[case testUnionOrNoneErrorSyntax]
 # flags: --python-version 3.10 --no-force-union-syntax
 from typing import Union
 x : Union[bool, None]
 x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool | None")
 
-[case testOptionalErrorSyntax]
+[case testUnionOptionalErrorSyntax]
 # flags: --python-version 3.10 --force-union-syntax
 from typing import Union
 x : Union[bool, None]
 x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "Optional[bool]")
 
-[case testNoneAsFinalItem]
+[case testUnionNoneAsFinalItem]
 # flags: --python-version 3.10 --no-force-union-syntax
 from typing import Union
 x : Union[bool, None, str]
 x = 3 # E: Incompatible types in assignment (expression has type "int", variable has type "bool | str | None")
 
-[case testLiteralOrErrorSyntax]
+[case testUnionLiteralOrErrorSyntax]
 # flags: --python-version 3.10 --no-force-union-syntax
 from typing import Literal, Union
 x : Union[Literal[1], Literal[2], str]
 x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Literal[1, 2] | str")
 [builtins fixtures/tuple.pyi]
 
-[case testLiteralUnionErrorSyntax]
+[case testUnionLiteralErrorSyntax]
 # flags: --python-version 3.10 --force-union-syntax
 from typing import Literal, Union
 x : Union[Literal[1], Literal[2], str]
 x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Union[str, Literal[1, 2]]")
 [builtins fixtures/tuple.pyi]
 
-[case testLiteralOrNoneErrorSyntax]
+[case testUnionLiteralOrNoneErrorSyntax]
 # flags: --python-version 3.10 --no-force-union-syntax
 from typing import Literal, Union
 x : Union[Literal[1], None]
 x = 3 # E: Incompatible types in assignment (expression has type "Literal[3]", variable has type "Literal[1] | None")
 [builtins fixtures/tuple.pyi]
 
-[case testLiteralOptionalErrorSyntax]
+[case testUnionLiteralOptionalErrorSyntax]
 # flags: --python-version 3.10 --force-union-syntax
 from typing import Literal, Union
 x : Union[Literal[1], None]

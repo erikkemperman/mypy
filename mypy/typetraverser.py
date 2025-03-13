@@ -12,6 +12,7 @@ from mypy.types import (
     EllipsisType,
     ErasedType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -99,6 +100,9 @@ class TypeTraverserVisitor(SyntheticTypeVisitor[None]):
     def visit_typeddict_type(self, t: TypedDictType, /) -> None:
         self.traverse_types(t.items.values())
         t.fallback.accept(self)
+
+    def visit_intersection_type(self, t: IntersectionType, /) -> None:
+        self.traverse_types(t.items)
 
     def visit_union_type(self, t: UnionType, /) -> None:
         self.traverse_types(t.items)

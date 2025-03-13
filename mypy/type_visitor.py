@@ -27,6 +27,7 @@ from mypy.types import (
     EllipsisType,
     ErasedType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -124,6 +125,10 @@ class TypeVisitor(Generic[T]):
 
     @abstractmethod
     def visit_literal_type(self, t: LiteralType, /) -> T:
+        pass
+
+    @abstractmethod
+    def visit_intersection_type(self, t: IntersectionType, /) -> T:
         pass
 
     @abstractmethod
@@ -291,6 +296,23 @@ class TypeTranslator(TypeVisitor[Type]):
         assert isinstance(fallback, Instance)  # type: ignore[misc]
         return LiteralType(value=t.value, fallback=fallback, line=t.line, column=t.column)
 
+    def visit_intersection_type(self, t: IntersectionType, /) -> Type:
+        # Use cache to avoid O(n**2) or worse expansion of types during translation
+        # (only for large intersections, since caching adds overhead)
+        use_cache = len(t.items) > 3
+        if use_cache and (cached := self.get_cached(t)):
+            return cached
+
+        result = IntersectionType(
+            self.translate_types(t.items),
+            t.line,
+            t.column,
+            uses_pep604_syntax=t.uses_pep604_syntax,
+        )
+        if use_cache:
+            self.set_cached(t, result)
+        return result
+
     def visit_union_type(self, t: UnionType, /) -> Type:
         # Use cache to avoid O(n**2) or worse expansion of types during translation
         # (only for large unions, since caching adds overhead)
@@ -420,6 +442,9 @@ class TypeQuery(SyntheticTypeVisitor[T]):
 
     def visit_literal_type(self, t: LiteralType, /) -> T:
         return self.strategy([])
+
+    def visit_intersection_type(self, t: IntersectionType, /) -> T:
+        return self.query_types(t.items)
 
     def visit_union_type(self, t: UnionType, /) -> T:
         return self.query_types(t.items)
@@ -560,6 +585,9 @@ class BoolTypeQuery(SyntheticTypeVisitor[bool]):
 
     def visit_literal_type(self, t: LiteralType, /) -> bool:
         return self.default
+
+    def visit_intersection_type(self, t: IntersectionType, /) -> bool:
+        return self.query_types(t.items)
 
     def visit_union_type(self, t: UnionType, /) -> bool:
         return self.query_types(t.items)

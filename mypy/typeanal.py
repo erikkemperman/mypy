@@ -76,6 +76,7 @@ from mypy.types import (
     EllipsisType,
     ErasedType,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -122,6 +123,7 @@ type_constructors: Final = {
     "typing.Optional",
     "typing.Tuple",
     "typing.Type",
+    "typing.Intersection",
     "typing.Union",
     *LITERAL_TYPE_NAMES,
     *ANNOTATED_TYPE_NAMES,
@@ -658,6 +660,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return self.tuple_type(
                 self.anal_array(t.args, allow_unpack=True), line=t.line, column=t.column
             )
+        elif fullname == "typing.Intersection":
+            items = self.anal_array(t.args)
+            return IntersectionType.make_intersection(items)
         elif fullname == "typing.Union":
             items = self.anal_array(t.args)
             return UnionType.make_union(items)
@@ -1401,6 +1406,18 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def visit_literal_type(self, t: LiteralType) -> Type:
         return t
 
+    def visit_intersection_type(self, t: IntersectionType) -> Type:
+        if (
+            t.uses_pep604_syntax is True
+            and t.is_evaluated is True
+            and not self.always_allow_new_syntax
+            and not self.options.python_version >= (3, 13)  # TODO
+        ):
+            self.fail("X & Y syntax for intersections requires Python 3.XYZ", t,
+                      code=codes.SYNTAX)
+        return IntersectionType(self.anal_array(t.items), t.line,
+                         uses_pep604_syntax=t.uses_pep604_syntax)
+
     def visit_union_type(self, t: UnionType) -> Type:
         if (
             t.uses_pep604_syntax is True
@@ -1720,7 +1737,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # This UnboundType was originally defined as a string.
         if (
             isinstance(arg, ProperType)
-            and isinstance(arg, (UnboundType, UnionType))
+            and isinstance(arg, (UnboundType, UnionType, IntersectionType))
             and arg.original_str_expr is not None
         ):
             assert arg.original_str_fallback is not None
@@ -1795,6 +1812,14 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 if union_result is None:
                     return None
                 out.extend(union_result)
+            return out
+        elif isinstance(arg, IntersectionType):
+            out = []
+            for intersection_arg in arg.items:
+                intersection_result = self.analyze_literal_param(idx, intersection_arg, ctx)
+                if intersection_result is None:
+                    return None
+                out.extend(intersection_result)
             return out
         else:
             self.fail(f"Parameter {idx} of Literal[...] is invalid", ctx, code=codes.VALID_TYPE)
@@ -2704,6 +2729,9 @@ class FindTypeVarVisitor(SyntheticTypeVisitor[None]):
 
     def visit_literal_type(self, t: LiteralType) -> None:
         pass
+
+    def visit_intersection_type(self, t: IntersectionType) -> None:
+        self.process_types(t.items)
 
     def visit_union_type(self, t: UnionType) -> None:
         self.process_types(t.items)

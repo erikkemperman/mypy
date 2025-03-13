@@ -64,13 +64,14 @@ from mypy.subtypes import (
     is_same_type,
     is_subtype,
 )
-from mypy.typeops import separate_union_literals
+from mypy.typeops import separate_intersection_literals, separate_union_literals
 from mypy.types import (
     AnyType,
     CallableType,
     DeletedType,
     FunctionLike,
     Instance,
+    IntersectionType,
     LiteralType,
     NoneType,
     Overloaded,
@@ -149,6 +150,7 @@ UNSUPPORTED_NUMBERS_TYPES: Final = {
 }
 
 MAX_TUPLE_ITEMS = 10
+MAX_INTERSECTION_ITEMS = 10
 MAX_UNION_ITEMS = 10
 
 
@@ -541,6 +543,24 @@ class MessageBuilder:
                     code=codes.UNION_ATTR,
                 )
                 return codes.UNION_ATTR
+            elif isinstance(original_type, IntersectionType):
+                # The checker passes "object" in lieu of "None" for attribute
+                # checks, so we manually convert it back.
+                typ_format, orig_type_format = format_type_distinctly(
+                    typ, original_type, options=self.options
+                )
+                if typ_format == '"object"' and any(
+                    type(item) == NoneType for item in original_type.items
+                ):
+                    typ_format = '"None"'
+                self.fail(
+                    'Item {} of {} has no attribute "{}"{}'.format(
+                        typ_format, orig_type_format, member, extra
+                    ),
+                    context,
+                    code=codes.INTERSECTION_ATTR,
+                )
+                return codes.INTERSECTION_ATTR
             elif isinstance(original_type, TypeVarType):
                 bound = get_proper_type(original_type.upper_bound)
                 if isinstance(bound, UnionType):
@@ -555,6 +575,18 @@ class MessageBuilder:
                         code=codes.UNION_ATTR,
                     )
                     return codes.UNION_ATTR
+                elif isinstance(bound, IntersectionType):
+                    typ_fmt, bound_fmt = format_type_distinctly(typ, bound, options=self.options)
+                    original_type_fmt = format_type(original_type, self.options)
+                    self.fail(
+                        "Item {} of the upper bound {} of type variable {} has no "
+                        'attribute "{}"{}'.format(
+                            typ_fmt, bound_fmt, original_type_fmt, member, extra
+                        ),
+                        context,
+                        code=codes.INTERSECTION_ATTR,
+                    )
+                    return codes.INTERSECTION_ATTR
             else:
                 self.fail(
                     '{} has no attribute "{}"{}'.format(
@@ -828,7 +860,7 @@ class MessageBuilder:
                         quote_type_string(expected_type_str),
                     )
                 expected_type = get_proper_type(expected_type)
-                if isinstance(expected_type, UnionType):
+                if isinstance(expected_type, (UnionType, IntersectionType)):
                     expected_types = list(expected_type.items)
                 else:
                     expected_types = [expected_type]
@@ -863,7 +895,7 @@ class MessageBuilder:
                 self.report_protocol_problems(
                     original_caller_type, callee_type, context, code=code
                 )
-            if isinstance(callee_type, UnionType):
+            if isinstance(callee_type, (UnionType, IntersectionType)):
                 for item in callee_type.items:
                     item = get_proper_type(item)
                     if isinstance(item, Instance) and item.type.is_protocol:
@@ -2545,6 +2577,22 @@ def format_type_inner(
     def format_list(types: Sequence[Type]) -> str:
         return ", ".join(format(typ) for typ in types)
 
+    def format_intersection_items(types: Sequence[Type]) -> list[str]:
+        formatted = [format(typ) for typ in types if format(typ) != "None"]
+        if len(formatted) > MAX_INTERSECTION_ITEMS and verbosity == 0:
+            more = len(formatted) - MAX_INTERSECTION_ITEMS // 2
+            formatted = formatted[: MAX_INTERSECTION_ITEMS // 2]
+        else:
+            more = 0
+        if more:
+            formatted.append(f"<{more} more items>")
+        if any(format(typ) == "None" for typ in types):
+            formatted.append("None")
+        return formatted
+
+    def format_intersection(types: Sequence[Type]) -> str:
+        return " & ".join(format_intersection_items(types))
+
     def format_union_items(types: Sequence[Type]) -> list[str]:
         formatted = [format(typ) for typ in types if format(typ) != "None"]
         if len(formatted) > MAX_UNION_ITEMS and verbosity == 0:
@@ -2666,7 +2714,7 @@ def format_type_inner(
     elif isinstance(typ, LiteralType):
         return f"Literal[{format_literal_value(typ)}]"
     elif isinstance(typ, UnionType):
-        typ = get_proper_type(ignore_last_known_values(typ))
+        typ = get_proper_type(ignore_last_known_union_values(typ))
         if not isinstance(typ, UnionType):
             return format(typ)
         literal_items, union_items = separate_union_literals(typ)
@@ -2711,6 +2759,40 @@ def format_type_inner(
                     if options.use_or_syntax()
                     else f"Union[{', '.join(format_union_items(typ.items))}]"
                 )
+            return s
+    elif isinstance(typ, IntersectionType):
+        typ = get_proper_type(ignore_last_known_intersection_values(typ))
+        if not isinstance(typ, IntersectionType):
+            return format(typ)
+        literal_items, intersection_items = separate_intersection_literals(typ)
+
+        # Coalesce multiple Literal[] members. This also changes output order.
+        # If there's just one Literal item, retain the original ordering.
+        if len(literal_items) > 1:
+            literal_str = "Literal[{}]".format(
+                ", ".join(format_literal_value(t) for t in literal_items)
+            )
+
+            if len(intersection_items) == 1 and isinstance(get_proper_type(intersection_items[0]), NoneType):
+                return (
+                    f"{literal_str} & None"
+                    if options.use_and_syntax()
+                    else f"Intersection[{literal_str}, None]"
+                )
+            elif intersection_items:
+                return (
+                    f"{literal_str} & {format_intersection(intersection_items)}"
+                    if options.use_and_syntax()
+                    else f"Intersection[{', '.join(format_intersection_items(intersection_items))}, {literal_str}]"
+                )
+            else:
+                return literal_str
+        else:
+            s = (
+                format_intersection(typ.items)
+                if options.use_and_syntax()
+                else f"Intersection[{', '.join(format_intersection_items(typ.items))}]"
+            )
             return s
     elif isinstance(typ, NoneType):
         return "None"
@@ -3359,7 +3441,7 @@ def format_key_list(keys: list[str], *, short: bool = False) -> str:
         return f"{td}keys ({', '.join(formatted_keys)})"
 
 
-def ignore_last_known_values(t: UnionType) -> Type:
+def ignore_last_known_union_values(t: UnionType) -> Type:
     """This will avoid types like str | str in error messages.
 
     last_known_values are kept during union simplification, but may cause
@@ -3377,3 +3459,22 @@ def ignore_last_known_values(t: UnionType) -> Type:
         else:
             union_items.append(item)
     return UnionType.make_union(union_items, t.line, t.column)
+
+def ignore_last_known_intersection_values(t: UnionType) -> Type:
+    """This will avoid types like str & str in error messages.
+
+    last_known_values are kept during intersection simplification, but may cause
+    weird formatting for e.g. tuples of literals.
+    """
+    intersection_items: list[Type] = []
+    seen_instances = set()
+    for item in t.items:
+        if isinstance(item, ProperType) and isinstance(item, Instance):
+            erased = item.copy_modified(last_known_value=None)
+            if erased in seen_instances:
+                continue
+            seen_instances.add(erased)
+            intersection_items.append(erased)
+        else:
+            intersection_items.append(item)
+    return IntersectionType.make_intersection(intersection_items, t.line, t.column)

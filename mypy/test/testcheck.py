@@ -138,6 +138,8 @@ class TypeCheckSuite(DataSuite):
             options.allow_empty_bodies = not testcase.name.endswith("_no_empty")
         if "lowercase" not in testcase.file:
             options.force_uppercase_builtins = True
+        if "intersection-error" not in testcase.file:
+            options.force_intersection_syntax = True
         if "union-error" not in testcase.file:
             options.force_union_syntax = True
 

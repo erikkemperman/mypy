@@ -19,3 +19,7 @@ if sys.version_info >= (3, 10):
 
     class UnionType:
         def __or__(self, x) -> UnionType: ...
+
+if sys.version_info >= (3, 13):  # TODO
+    class IntersectionType:
+        def __or__(self, x) -> IntersectionType: ...
