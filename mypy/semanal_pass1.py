@@ -46,13 +46,13 @@ class SemanticAnalyzerPreAnalysis(TraverserVisitor):
       import sys
 
       def do_stuff() -> None:
-          if sys.version_info >= (3, 10):
-              import xyz  # Only available in Python 3.10+
+          if sys.version_info >= (3, 11):
+              import xyz  # Only available in Python 3.11+
               xyz.whatever()
           ...
 
-    The block containing 'import xyz' is unreachable in Python 3 mode. The import
-    shouldn't be processed in Python 3 mode, even if the module happens to exist.
+    The block containing 'import xyz' is unreachable in Python 3.10 mode. The import
+    shouldn't be processed in Python 3.10 mode, even if the module happens to exist.
     """
 
     def visit_file(self, file: MypyFile, fnam: str, mod_id: str, options: Options) -> None:
@@ -74,6 +74,9 @@ class SemanticAnalyzerPreAnalysis(TraverserVisitor):
                     if last.end_line is not None:
                         # We are on a Python version recent enough to support end lines.
                         self.skipped_lines |= set(range(next_def.line, last.end_line + 1))
+                file.imports = [
+                    i for i in file.imports if (i.line, i.column) <= (defn.line, defn.column)
+                ]
                 del file.defs[i + 1 :]
                 break
         file.skipped_lines = self.skipped_lines

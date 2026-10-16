@@ -14,17 +14,20 @@ Also build a mapping from mypy TypeInfos to ClassIR objects.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, NamedTuple, Tuple
+from collections.abc import Iterable
+from typing import NamedTuple
 
 from mypy.build import Graph
 from mypy.nodes import (
     ARG_STAR,
     ARG_STAR2,
+    AssignmentStmt,
     CallExpr,
     ClassDef,
     Decorator,
     Expression,
     FuncDef,
+    IndexExpr,
     MemberExpr,
     MypyFile,
     NameExpr,
@@ -37,7 +40,15 @@ from mypy.nodes import (
 from mypy.semanal import refers_to_fullname
 from mypy.traverser import TraverserVisitor
 from mypy.types import Instance, Type, get_proper_type
-from mypyc.common import PROPSET_PREFIX, get_id_from_name
+from mypy.util import is_dunder
+from mypyc.common import (
+    FAST_PREFIX,
+    GENERATOR_HELPER_NAME,
+    MYPYC_DEFAULTS_SETUP,
+    PROPSET_PREFIX,
+    SELF_NAME,
+    get_id_from_name,
+)
 from mypyc.crash import catch_errors
 from mypyc.errors import Errors
 from mypyc.ir.class_ir import ClassIR
@@ -50,12 +61,25 @@ from mypyc.ir.func_ir import (
     RuntimeArg,
 )
 from mypyc.ir.ops import DeserMaps
-from mypyc.ir.rtypes import RInstance, RType, dict_rprimitive, none_rprimitive, tuple_rprimitive
+from mypyc.ir.rtypes import (
+    RInstance,
+    RType,
+    bool_rprimitive,
+    dict_rprimitive,
+    none_rprimitive,
+    object_pointer_rprimitive,
+    object_rprimitive,
+    tuple_rprimitive,
+)
 from mypyc.irbuild.mapper import Mapper
 from mypyc.irbuild.util import (
+    dataclass_type,
+    default_attr_name,
     get_func_def,
     get_mypyc_attrs,
+    is_class_body_final,
     is_dataclass,
+    is_decorated_class,
     is_extension_class,
     is_trait,
 )
@@ -81,23 +105,38 @@ def build_type_map(
     # references even if there are import cycles.
     for module, cdef in classes:
         class_ir = ClassIR(
-            cdef.name, module.fullname, is_trait(cdef), is_abstract=cdef.info.is_abstract
+            cdef.name,
+            module.fullname,
+            is_trait(cdef),
+            is_abstract=cdef.info.is_abstract,
+            is_final_class=cdef.info.is_final,
         )
-        class_ir.is_ext_class = is_extension_class(cdef)
+        class_ir.is_ext_class = is_extension_class(module.path, cdef, errors)
+        class_ir.is_decorated = is_decorated_class(cdef)
         if class_ir.is_ext_class:
             class_ir.deletable = cdef.info.deletable_attributes.copy()
         # If global optimizations are disabled, turn of tracking of class children
         if not options.global_opts:
             class_ir.children = None
         mapper.type_to_ir[cdef.info] = class_ir
+        mapper.symbol_fullnames.add(class_ir.fullname)
+        class_ir.is_enum = cdef.info.is_enum and len(cdef.info.enum_members) > 0
 
     # Populate structural information in class IR for extension classes.
     for module, cdef in classes:
         with catch_errors(module.path, cdef.line):
             if mapper.type_to_ir[cdef.info].is_ext_class:
-                prepare_class_def(module.path, module.fullname, cdef, errors, mapper)
+                prepare_class_def(module.path, module.fullname, cdef, errors, mapper, options)
             else:
-                prepare_non_ext_class_def(module.path, module.fullname, cdef, errors, mapper)
+                prepare_non_ext_class_def(
+                    module.path, module.fullname, cdef, errors, mapper, options
+                )
+
+    # Validate cross-class properties after all ClassIR flags are populated.
+    for module, cdef in classes:
+        with catch_errors(module.path, cdef.line):
+            if mapper.type_to_ir[cdef.info].is_ext_class:
+                validate_acyclic_class_bases(module.path, cdef, errors, mapper)
 
     # Prepare implicit attribute accessors as needed if an attribute overrides a property.
     for module, cdef in classes:
@@ -105,12 +144,30 @@ def build_type_map(
         if class_ir.is_ext_class:
             prepare_implicit_property_accessors(cdef.info, class_ir, module.fullname, mapper)
 
+    # Register __mypyc_defaults_setup FuncDecls on classes that have their own
+    # class-level default attribute assignments. Done here, before any IR build
+    # runs, so that the cross-class lookup in generate_attr_defaults_init is
+    # order-independent: IR build within a compilation group proceeds in
+    # filename order, so a subclass may be IR-built before its base.
+    for module, cdef in classes:
+        class_ir = mapper.type_to_ir[cdef.info]
+        if class_ir.is_ext_class and _has_own_default_attrs(cdef, class_ir):
+            _register_defaults_setup_decl(class_ir, module.fullname)
+
+    # Validate __deletable__ declarations. Done here so the compiler exits
+    # early on invalid input before any IR is built.
+    for module, cdef in classes:
+        class_ir = mapper.type_to_ir[cdef.info]
+        if class_ir.is_ext_class:
+            with catch_errors(module.path, cdef.line):
+                _check_deletable_declarations(module.path, cdef, class_ir, errors)
+
     # Collect all the functions also. We collect from the symbol table
     # so that we can easily pick out the right copy of a function that
-    # is conditionally defined.
+    # is conditionally defined. This doesn't include nested functions!
     for module in modules:
         for func in get_module_func_defs(module):
-            prepare_func_def(module.fullname, None, func, mapper)
+            prepare_func_def(module.fullname, None, func, mapper, options)
             # TODO: what else?
 
     # Check for incompatible attribute definitions that were not
@@ -140,10 +197,28 @@ def load_type_map(mapper: Mapper, modules: list[MypyFile], deser_ctx: DeserMaps)
     """Populate a Mapper with deserialized IR from a list of modules."""
     for module in modules:
         for node in module.names.values():
-            if isinstance(node.node, TypeInfo) and is_from_module(node.node, module):
-                ir = deser_ctx.classes[node.node.fullname]
+            if (
+                isinstance(node.node, TypeInfo)
+                and is_from_module(node.node, module)
+                and not node.node.is_newtype
+                and not node.node.is_named_tuple
+                and node.node.typeddict_type is None
+            ):
+                # Some TypeInfo entries are mypy-synthetic (e.g. anonymous
+                # intersection classes like "<subclass of X and Y>") and have
+                # no corresponding mypyc ClassIR. Skip those rather than
+                # aborting the whole cache load.
+                ir = deser_ctx.classes.get(node.node.fullname)
+                if ir is None:
+                    continue
                 mapper.type_to_ir[node.node] = ir
-                mapper.func_to_decl[node.node] = ir.ctor
+                mapper.symbol_fullnames.add(node.node.fullname)
+                # Non-extension, trait and builtin-base classes have no
+                # emitted CPyDef_<ctor>, so a cross-group direct call
+                # would hit an undefined symbol. Mirror the conditions
+                # under which prepare_init_method registers a ctor.
+                if ir.is_ext_class and not ir.is_trait and not ir.builtin_base:
+                    mapper.func_to_decl[node.node] = ir.ctor
 
     for module in modules:
         for func in get_module_func_defs(module):
@@ -164,27 +239,81 @@ def get_module_func_defs(module: MypyFile) -> Iterable[FuncDef]:
 
 
 def prepare_func_def(
-    module_name: str, class_name: str | None, fdef: FuncDef, mapper: Mapper
+    module_name: str,
+    class_name: str | None,
+    fdef: FuncDef,
+    mapper: Mapper,
+    options: CompilerOptions,
 ) -> FuncDecl:
     kind = (
-        FUNC_STATICMETHOD
-        if fdef.is_static
-        else (FUNC_CLASSMETHOD if fdef.is_class else FUNC_NORMAL)
+        FUNC_CLASSMETHOD
+        if fdef.is_class
+        else (FUNC_STATICMETHOD if fdef.is_static else FUNC_NORMAL)
     )
-    decl = FuncDecl(fdef.name, class_name, module_name, mapper.fdef_to_sig(fdef), kind)
+    sig = mapper.fdef_to_sig(fdef, options.strict_dunders_typing)
+    decl = FuncDecl(
+        fdef.name,
+        class_name,
+        module_name,
+        sig,
+        kind,
+        is_generator=fdef.is_generator,
+        is_coroutine=fdef.is_coroutine,
+        is_final=fdef.is_final,
+    )
     mapper.func_to_decl[fdef] = decl
     return decl
 
 
+def create_generator_class_for_func(
+    module_name: str, class_name: str | None, fdef: FuncDef, mapper: Mapper, name_suffix: str = ""
+) -> ClassIR:
+    """For a generator/async function, declare a generator class.
+
+    Each generator and async function gets a dedicated class that implements the
+    generator protocol with generated methods.
+    """
+    assert fdef.is_coroutine or fdef.is_generator
+    name = "_".join(x for x in [fdef.name, class_name] if x) + "_gen" + name_suffix
+    cir = ClassIR(name, module_name, is_generated=True, is_final_class=class_name is None)
+    cir.reuse_freed_instance = True
+    mapper.fdef_to_generator[fdef] = cir
+
+    helper_sig = FuncSignature(
+        (
+            RuntimeArg(SELF_NAME, object_rprimitive),
+            RuntimeArg("type", object_rprimitive),
+            RuntimeArg("value", object_rprimitive),
+            RuntimeArg("traceback", object_rprimitive),
+            RuntimeArg("arg", object_rprimitive),
+            # If non-NULL, used to store return value instead of raising StopIteration(retv)
+            RuntimeArg("stop_iter_ptr", object_pointer_rprimitive),
+        ),
+        object_rprimitive,
+    )
+
+    # The implementation of most generator functionality is behind this magic method.
+    helper_fn_decl = FuncDecl(GENERATOR_HELPER_NAME, name, module_name, helper_sig, internal=True)
+    cir.method_decls[helper_fn_decl.name] = helper_fn_decl
+    return cir
+
+
 def prepare_method_def(
-    ir: ClassIR, module_name: str, cdef: ClassDef, mapper: Mapper, node: FuncDef | Decorator
+    ir: ClassIR,
+    module_name: str,
+    cdef: ClassDef,
+    mapper: Mapper,
+    node: FuncDef | Decorator,
+    options: CompilerOptions,
 ) -> None:
     if isinstance(node, FuncDef):
-        ir.method_decls[node.name] = prepare_func_def(module_name, cdef.name, node, mapper)
+        ir.method_decls[node.name] = prepare_func_def(
+            module_name, cdef.name, node, mapper, options
+        )
     elif isinstance(node, Decorator):
         # TODO: do something about abstract methods here. Currently, they are handled just like
         # normal methods.
-        decl = prepare_func_def(module_name, cdef.name, node.func, mapper)
+        decl = prepare_func_def(module_name, cdef.name, node.func, mapper, options)
         if not node.decorators:
             ir.method_decls[node.name] = decl
         elif isinstance(node.decorators[0], MemberExpr) and node.decorators[0].name == "setter":
@@ -196,11 +325,70 @@ def prepare_method_def(
             # Making the argument implicitly positional-only avoids unnecessary glue methods
             decl.sig.args[1].pos_only = True
             ir.method_decls[PROPSET_PREFIX + node.name] = decl
+        elif (
+            decl.kind == FUNC_NORMAL
+            and not node.func.is_property
+            and not node.func.is_generator
+            and not node.func.is_coroutine
+            and overrides_native_method(cdef, node.name, mapper)
+        ):
+            # Native calls to a decorated override are dispatched through the vtable
+            # to a glue method that calls the decorated attribute. It's internal since
+            # the decorated attribute replaces it in the type dict.
+            decl.internal = True
+            decl.is_decorated_override = True
+            ir.method_decls[node.name] = decl
 
         if node.func.is_property:
             assert node.func.type, f"Expected return type annotation for property '{node.name}'"
             decl.is_prop_getter = True
             ir.property_types[node.name] = decl.sig.ret_type
+
+
+def overrides_native_method(cdef: ClassDef, name: str, mapper: Mapper) -> bool:
+    # Dunders are excluded since they are called through type slots
+    if is_dunder(name):
+        return False
+    for base in cdef.info.mro[1:]:
+        sym = base.names.get(name)
+        if sym is not None:
+            base_ir = mapper.type_to_ir.get(base)
+            return (
+                base_ir is not None
+                and base_ir.is_ext_class
+                and isinstance(sym.node, (FuncDef, Decorator, OverloadedFuncDef))
+            )
+    return False
+
+
+def prepare_fast_path(
+    ir: ClassIR,
+    module_name: str,
+    cdef: ClassDef,
+    mapper: Mapper,
+    node: SymbolNode | None,
+    options: CompilerOptions,
+) -> None:
+    """Add fast (direct) variants of methods in non-extension classes."""
+    if ir.is_enum:
+        # We check that non-empty enums are implicitly final in mypy, so we
+        # can generate direct calls to enum methods.
+        if isinstance(node, OverloadedFuncDef):
+            if node.is_property:
+                return
+            node = node.impl
+        if not isinstance(node, FuncDef):
+            # TODO: support decorated methods (at least @classmethod and @staticmethod).
+            return
+        # The simplest case is a regular or overloaded method without decorators. In this
+        # case we can generate practically identical IR method body, but with a signature
+        # suitable for direct calls (usual non-extension class methods are converted to
+        # callable classes, and thus have an extra __mypyc_self__ argument).
+        name = FAST_PREFIX + node.name
+        sig = mapper.fdef_to_sig(node, options.strict_dunders_typing)
+        decl = FuncDecl(name, cdef.name, module_name, sig, FUNC_NORMAL)
+        ir.method_decls[name] = decl
+    return
 
 
 def is_valid_multipart_property_def(prop: OverloadedFuncDef) -> bool:
@@ -236,8 +424,120 @@ def can_subclass_builtin(builtin_base: str) -> bool:
     )
 
 
+def get_removed_base_fullname(expr: Expression) -> str | None:
+    if isinstance(expr, IndexExpr):
+        expr = expr.base
+    if isinstance(expr, RefExpr):
+        return expr.fullname
+    return None
+
+
+def find_non_acyclic_base(cdef: ClassDef, mapper: Mapper) -> str | None:
+    if cdef.type_args:
+        return "typing.Generic"
+
+    for expr in cdef.removed_base_type_exprs:
+        if fullname := get_removed_base_fullname(expr):
+            return fullname
+        return "a removed base class"
+
+    for base in cdef.info.mro[1:]:
+        if base.fullname == "builtins.object":
+            continue
+
+        base_ir = mapper.type_to_ir.get(base)
+        if base_ir is not None and base_ir.is_acyclic:
+            continue
+
+        return base.fullname
+
+    return None
+
+
+def validate_acyclic_class_bases(
+    path: str, cdef: ClassDef, errors: Errors, mapper: Mapper
+) -> None:
+    ir = mapper.type_to_ir[cdef.info]
+    if not ir.is_acyclic:
+        return
+
+    if fullname := find_non_acyclic_base(cdef, mapper):
+        errors.error(
+            f'"acyclic" can\'t be used in a class that inherits from non-acyclic type "{fullname}"',
+            path,
+            cdef.line,
+        )
+
+
+def _has_own_default_attrs(cdef: ClassDef, ir: ClassIR) -> bool:
+    """Whether this class's own body has any default attribute assignment
+    that would be emitted into __mypyc_defaults_setup.
+
+    Used during prepare to decide whether to register a
+    __mypyc_defaults_setup FuncDecl ahead of IR build.
+    """
+    if ir.builtin_base or ir.is_trait:
+        return False
+    cls_type = dataclass_type(cdef)
+    return any(
+        default_attr_name(stmt, ir, cls_type) is not None
+        for stmt in cdef.info.defn.defs.body
+        if isinstance(stmt, AssignmentStmt)
+    )
+
+
+def _register_defaults_setup_decl(ir: ClassIR, module_name: str) -> None:
+    sig = FuncSignature([RuntimeArg(SELF_NAME, RInstance(ir))], bool_rprimitive)
+    ir.method_decls[MYPYC_DEFAULTS_SETUP] = FuncDecl(
+        MYPYC_DEFAULTS_SETUP, ir.name, module_name, sig
+    )
+
+
+def _check_deletable_declarations(path: str, cdef: ClassDef, ir: ClassIR, errors: Errors) -> None:
+    """Validate that attributes listed in __deletable__ refer to definable
+    attributes on the class.
+
+    Runs in the prepare phase so we exit early on invalid programs before
+    any IR is built.
+    """
+    if not ir.deletable:
+        return
+    line = next(
+        (
+            stmt.line
+            for stmt in cdef.info.defn.defs.body
+            if isinstance(stmt, AssignmentStmt)
+            and isinstance(stmt.lvalues[0], NameExpr)
+            and stmt.lvalues[0].name == "__deletable__"
+        ),
+        cdef.line,
+    )
+    for attr in ir.deletable:
+        if attr not in ir.attributes:
+            if not ir.has_attr(attr):
+                errors.error(f'Attribute "{attr}" not defined', path, line)
+                continue
+            for base in ir.mro:
+                if attr in base.property_types:
+                    errors.error(f'Cannot make property "{attr}" deletable', path, line)
+                    break
+            else:
+                _, base = ir.attr_details(attr)
+                errors.error(
+                    f'Attribute "{attr}" not defined in "{ir.name}" '
+                    f'(defined in "{base.name}")',
+                    path,
+                    line,
+                )
+
+
 def prepare_class_def(
-    path: str, module_name: str, cdef: ClassDef, errors: Errors, mapper: Mapper
+    path: str,
+    module_name: str,
+    cdef: ClassDef,
+    errors: Errors,
+    mapper: Mapper,
+    options: CompilerOptions,
 ) -> None:
     """Populate the interface-level information in a class IR.
 
@@ -248,12 +548,15 @@ def prepare_class_def(
     ir = mapper.type_to_ir[cdef.info]
     info = cdef.info
 
-    attrs = get_mypyc_attrs(cdef)
+    attrs, attrs_lines = get_mypyc_attrs(cdef, path, errors)
     if attrs.get("allow_interpreted_subclasses") is True:
         ir.allow_interpreted_subclasses = True
     if attrs.get("serializable") is True:
         # Supports copy.copy and pickle (including subclasses)
         ir._serializable = True
+
+    if attrs.get("acyclic") is True:
+        ir.is_acyclic = True
 
     # Check for subclassing from builtin types
     for cls in info.mro:
@@ -272,6 +575,38 @@ def prepare_class_def(
                 errors.error(
                     "Inheriting from most builtin types is unimplemented", path, cdef.line
                 )
+                errors.note(
+                    "Potential workaround: @mypy_extensions.mypyc_attr(native_class=False)",
+                    path,
+                    cdef.line,
+                )
+                errors.note(
+                    "https://mypyc.readthedocs.io/en/stable/native_classes.html#defining-non-native-classes",
+                    path,
+                    cdef.line,
+                )
+
+    free_list_len = attrs.get("free_list_len")
+    if free_list_len is not None:
+        line = attrs_lines["free_list_len"]
+        if ir.is_trait:
+            errors.error('"free_list_len" can\'t be used with traits', path, line)
+        if ir.allow_interpreted_subclasses:
+            errors.error(
+                '"free_list_len" can\'t be used in a class that allows interpreted subclasses',
+                path,
+                line,
+            )
+        if ir.builtin_base:
+            errors.error(
+                '"free_list_len" can\'t be used in a class that inherits from a built-in type',
+                path,
+                line,
+            )
+        if free_list_len == 1:
+            ir.reuse_freed_instance = True
+        else:
+            errors.error(f'Unsupported value for "free_list_len": {free_list_len}', path, line)
 
     # Set up the parent class
     bases = [mapper.type_to_ir[base.type] for base in info.bases if base.type in mapper.type_to_ir]
@@ -304,7 +639,7 @@ def prepare_class_def(
     ir.mro = mro
     ir.base_mro = base_mro
 
-    prepare_methods_and_attributes(cdef, ir, path, module_name, errors, mapper)
+    prepare_methods_and_attributes(cdef, ir, path, module_name, errors, mapper, options)
     prepare_init_method(cdef, ir, module_name, mapper)
 
     for base in bases:
@@ -316,7 +651,13 @@ def prepare_class_def(
 
 
 def prepare_methods_and_attributes(
-    cdef: ClassDef, ir: ClassIR, path: str, module_name: str, errors: Errors, mapper: Mapper
+    cdef: ClassDef,
+    ir: ClassIR,
+    path: str,
+    module_name: str,
+    errors: Errors,
+    mapper: Mapper,
+    options: CompilerOptions,
 ) -> None:
     """Populate attribute and method declarations."""
     info = cdef.info
@@ -329,6 +670,11 @@ def prepare_methods_and_attributes(
             assert node.node.type, "Class member %s missing type" % name
             if not node.node.is_classvar and name not in ("__slots__", "__deletable__"):
                 attr_rtype = mapper.type_to_rtype(node.node.type)
+                if is_class_body_final(node.node, ir, cdef, attr_rtype):
+                    # No instance slot: the value lives in a module-level static
+                    # and on the type object. See ClassIR.class_final_attributes.
+                    ir.class_final_attributes[name] = attr_rtype
+                    continue
                 if ir.is_trait and attr_rtype.error_overlap:
                     # Traits don't have attribute definedness bitmaps, so use
                     # property accessor methods to access attributes that need them.
@@ -337,21 +683,27 @@ def prepare_methods_and_attributes(
                     add_getter_declaration(ir, name, attr_rtype, module_name)
                     add_setter_declaration(ir, name, attr_rtype, module_name)
                 ir.attributes[name] = attr_rtype
+                if node.node.is_final:
+                    ir.final_attributes.add(name)
         elif isinstance(node.node, (FuncDef, Decorator)):
-            prepare_method_def(ir, module_name, cdef, mapper, node.node)
+            prepare_method_def(ir, module_name, cdef, mapper, node.node, options)
         elif isinstance(node.node, OverloadedFuncDef):
             # Handle case for property with both a getter and a setter
             if node.node.is_property:
                 if is_valid_multipart_property_def(node.node):
                     for item in node.node.items:
-                        prepare_method_def(ir, module_name, cdef, mapper, item)
+                        prepare_method_def(ir, module_name, cdef, mapper, item, options)
                 else:
                     errors.error("Unsupported property decorator semantics", path, cdef.line)
 
             # Handle case for regular function overload
             else:
-                assert node.node.impl
-                prepare_method_def(ir, module_name, cdef, mapper, node.node.impl)
+                if not node.node.impl:
+                    errors.error(
+                        "Overloads without implementation are not supported", path, cdef.line
+                    )
+                else:
+                    prepare_method_def(ir, module_name, cdef, mapper, node.node.impl, options)
 
     if ir.builtin_base:
         ir.attributes.clear()
@@ -432,21 +784,57 @@ def add_setter_declaration(
     ir.method_decls[setter_name] = decl
 
 
+def check_matching_args(init_sig: FuncSignature, new_sig: FuncSignature) -> bool:
+    num_init_args = len(init_sig.args) - init_sig.num_bitmap_args
+    num_new_args = len(new_sig.args) - new_sig.num_bitmap_args
+    if num_init_args != num_new_args:
+        return False
+
+    for idx in range(1, num_init_args):
+        init_arg = init_sig.args[idx]
+        new_arg = new_sig.args[idx]
+        if init_arg.type != new_arg.type:
+            return False
+
+        if init_arg.kind != new_arg.kind:
+            return False
+
+    return True
+
+
 def prepare_init_method(cdef: ClassDef, ir: ClassIR, module_name: str, mapper: Mapper) -> None:
     # Set up a constructor decl
     init_node = cdef.info["__init__"].node
+
+    new_node: SymbolNode | None = None
+    new_symbol = cdef.info.get("__new__")
+    # We are only interested in __new__ method defined in a user-defined class,
+    # so we ignore it if it comes from a builtin type. It's usually builtins.object
+    # but could also be builtins.type for metaclasses so we detect the prefix which
+    # matches both.
+    if new_symbol and new_symbol.fullname and not new_symbol.fullname.startswith("builtins."):
+        new_node = new_symbol.node
+    if isinstance(new_node, (Decorator, OverloadedFuncDef)):
+        new_node = get_func_def(new_node)
     if not ir.is_trait and not ir.builtin_base and isinstance(init_node, FuncDef):
-        init_sig = mapper.fdef_to_sig(init_node)
+        init_sig = mapper.fdef_to_sig(init_node, True)
+        args_match = True
+        if isinstance(new_node, FuncDef):
+            new_sig = mapper.fdef_to_sig(new_node, True)
+            args_match = check_matching_args(init_sig, new_sig)
 
         defining_ir = mapper.type_to_ir.get(init_node.info)
         # If there is a nontrivial __init__ that wasn't defined in an
         # extension class, we need to make the constructor take *args,
         # **kwargs so it can call tp_init.
         if (
-            defining_ir is None
-            or not defining_ir.is_ext_class
-            or cdef.info["__init__"].plugin_generated
-        ) and init_node.info.fullname != "builtins.object":
+            (
+                defining_ir is None
+                or not defining_ir.is_ext_class
+                or cdef.info["__init__"].plugin_generated
+            )
+            and init_node.info.fullname != "builtins.object"
+        ) or not args_match:
             init_sig = FuncSignature(
                 [
                     init_sig.args[0],
@@ -463,24 +851,31 @@ def prepare_init_method(cdef: ClassDef, ir: ClassIR, module_name: str, mapper: M
 
 
 def prepare_non_ext_class_def(
-    path: str, module_name: str, cdef: ClassDef, errors: Errors, mapper: Mapper
+    path: str,
+    module_name: str,
+    cdef: ClassDef,
+    errors: Errors,
+    mapper: Mapper,
+    options: CompilerOptions,
 ) -> None:
     ir = mapper.type_to_ir[cdef.info]
     info = cdef.info
 
     for node in info.names.values():
         if isinstance(node.node, (FuncDef, Decorator)):
-            prepare_method_def(ir, module_name, cdef, mapper, node.node)
+            prepare_method_def(ir, module_name, cdef, mapper, node.node, options)
         elif isinstance(node.node, OverloadedFuncDef):
             # Handle case for property with both a getter and a setter
             if node.node.is_property:
                 if not is_valid_multipart_property_def(node.node):
                     errors.error("Unsupported property decorator semantics", path, cdef.line)
                 for item in node.node.items:
-                    prepare_method_def(ir, module_name, cdef, mapper, item)
+                    prepare_method_def(ir, module_name, cdef, mapper, item, options)
             # Handle case for regular function overload
             else:
-                prepare_method_def(ir, module_name, cdef, mapper, get_func_def(node.node))
+                prepare_method_def(ir, module_name, cdef, mapper, get_func_def(node.node), options)
+
+        prepare_fast_path(ir, module_name, cdef, mapper, node.node, options)
 
     if any(cls in mapper.type_to_ir and mapper.type_to_ir[cls].is_ext_class for cls in info.mro):
         errors.error(
@@ -488,7 +883,7 @@ def prepare_non_ext_class_def(
         )
 
 
-RegisterImplInfo = Tuple[TypeInfo, FuncDef]
+RegisterImplInfo = tuple[TypeInfo, FuncDef]
 
 
 class SingledispatchInfo(NamedTuple):
@@ -519,6 +914,12 @@ class SingledispatchVisitor(TraverserVisitor):
         self.decorators_to_remove: dict[FuncDef, list[int]] = {}
 
         self.errors: Errors = errors
+        self.func_stack_depth = 0
+
+    def visit_func_def(self, o: FuncDef) -> None:
+        self.func_stack_depth += 1
+        super().visit_func_def(o)
+        self.func_stack_depth -= 1
 
     def visit_decorator(self, dec: Decorator) -> None:
         if dec.decorators:
@@ -530,6 +931,10 @@ class SingledispatchVisitor(TraverserVisitor):
             for i, d in enumerate(decorators_to_store):
                 impl = get_singledispatch_register_call_info(d, dec.func)
                 if impl is not None:
+                    if self.func_stack_depth > 0:
+                        self.errors.error(
+                            "Registering nested functions not supported", self.current_path, d.line
+                        )
                     self.singledispatch_impls[impl.singledispatch_func].append(
                         (impl.dispatch_type, dec.func)
                     )
@@ -546,6 +951,12 @@ class SingledispatchVisitor(TraverserVisitor):
                         )
                 else:
                     if refers_to_fullname(d, "functools.singledispatch"):
+                        if self.func_stack_depth > 0:
+                            self.errors.error(
+                                "Nested singledispatch functions not supported",
+                                self.current_path,
+                                d.line,
+                            )
                         decorators_to_remove.append(i)
                         # make sure that we still treat the function as a singledispatch function
                         # even if we don't find any registered implementations (which might happen
@@ -607,3 +1018,82 @@ def registered_impl_from_possible_register_call(
         if isinstance(node, Decorator):
             return RegisteredImpl(node.func, dispatch_type)
     return None
+
+
+def adjust_generator_classes_of_methods(mapper: Mapper) -> None:
+    """Make optimizations and adjustments to generated generator classes of methods.
+
+    This is a separate pass after type map has been built, since we need all classes
+    to be processed to analyze class hierarchies.
+    """
+
+    generator_methods = []
+
+    for fdef, fn_ir in mapper.func_to_decl.items():
+        if isinstance(fdef, FuncDef) and (fdef.is_coroutine or fdef.is_generator):
+            gen_ir = create_generator_class_for_func(
+                fn_ir.module_name, fn_ir.class_name, fdef, mapper
+            )
+            # TODO: We could probably support decorators sometimes (static and class method?)
+            if not fdef.is_decorated:
+                name = fn_ir.name
+                precise_ret_type = True
+                if fn_ir.class_name is not None:
+                    class_ir = mapper.type_to_ir[fdef.info]
+                    subcls = class_ir.subclasses()
+                    if subcls is None:
+                        # Override could be of a different type, so we can't make assumptions.
+                        precise_ret_type = False
+                    elif class_ir.is_trait:
+                        # Give up on traits. We could possibly have an abstract base class
+                        # for generator return types to make this use precise types.
+                        precise_ret_type = False
+                    else:
+                        for s in subcls:
+                            if name in s.method_decls:
+                                m = s.method_decls[name]
+                                if (
+                                    m.is_generator != fn_ir.is_generator
+                                    or m.is_coroutine != fn_ir.is_coroutine
+                                ):
+                                    # Override is of a different kind, and the optimization
+                                    # to use a precise generator return type doesn't work.
+                                    precise_ret_type = False
+                else:
+                    class_ir = None
+
+                if precise_ret_type:
+                    # Give a more precise type for generators, so that we can optimize
+                    # code that uses them. They return a generator object, which has a
+                    # specific class. Without this, the type would have to be 'object'.
+                    fn_ir.sig.ret_type = RInstance(gen_ir)
+                    if fn_ir.bound_sig:
+                        fn_ir.bound_sig.ret_type = RInstance(gen_ir)
+                    if class_ir is not None:
+                        if class_ir.is_method_final(name):
+                            gen_ir.is_final_class = True
+                        generator_methods.append((name, class_ir, gen_ir))
+
+    new_bases = {}
+
+    for name, class_ir, gen in generator_methods:
+        # For generator methods, we need to have subclass generator classes inherit from
+        # baseclass generator classes when there are overrides to maintain LSP.
+        base = class_ir.real_base()
+        if base is not None:
+            if base.has_method(name):
+                base_sig = base.method_sig(name)
+                if isinstance(base_sig.ret_type, RInstance):
+                    base_gen = base_sig.ret_type.class_ir
+                    new_bases[gen] = base_gen
+
+    # Add generator inheritance relationships by adjusting MROs.
+    for deriv, base in new_bases.items():
+        if base.children is not None:
+            base.children.append(deriv)
+        while True:
+            deriv.mro.append(base)
+            deriv.base_mro.append(base)
+            if base not in new_bases:
+                break
+            base = new_bases[base]

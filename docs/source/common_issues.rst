@@ -41,7 +41,7 @@ once you add annotations:
 
     def foo(a: str) -> str:
         return '(' + a.split() + ')'
-    # error: Unsupported operand types for + ("str" and List[str])
+    # error: Unsupported operand types for + ("str" and "list[str]")
 
 If you don't know what types to add, you can use ``Any``, but beware:
 
@@ -148,6 +148,14 @@ error:
 The second line is now fine, since the ignore comment causes the name
 ``frobnicate`` to get an implicit ``Any`` type.
 
+The type ignore comment must be at the start of the comments on a line.
+This type ignore will not take effect:
+
+.. code-block:: python
+
+    import frobnicate  #example other comment # type: ignore
+    frobnicate.start()
+
 .. note::
 
     You can use the form ``# type: ignore[<code>]`` to only ignore
@@ -218,6 +226,14 @@ daemon <mypy_daemon>`, which can speed up incremental mypy runtimes by
 a factor of 10 or more. :ref:`Remote caching <remote-cache>` can
 make cold mypy runs several times faster.
 
+Furthermore: as of `mypy 1.13 <https://mypy-lang.blogspot.com/2024/10/mypy-113-released.html>`_,
+mypy allows use of the orjson library for handling the cache instead of the stdlib json, for
+improved performance. You can ensure the presence of orjson using the ``faster-cache`` extra:
+
+    python3 -m pip install -U mypy[faster-cache]
+
+Mypy may depend on orjson by default in the future.
+
 Types of empty collections
 --------------------------
 
@@ -226,7 +242,7 @@ dict to a new variable, as mentioned earlier:
 
 .. code-block:: python
 
-   a: List[int] = []
+   a: list[int] = []
 
 Without the annotation mypy can't always figure out the
 precise type of ``a``.
@@ -238,7 +254,7 @@ modification operation in the same scope (such as ``append`` for a list):
 
 .. code-block:: python
 
-   a = []  # Okay because followed by append, inferred type List[int]
+   a = []  # Okay because followed by append, inferred type list[int]
    for i in range(n):
        a.append(i * i)
 
@@ -276,7 +292,7 @@ not support ``sort()``) as a list and sort it in-place:
     def f(x: Sequence[int]) -> None:
         # Type of x is Sequence[int] here; we don't know the concrete type.
         x = list(x)
-        # Type of x is List[int] here.
+        # Type of x is list[int] here.
         x.sort()  # Okay!
 
 See :ref:`type-narrowing` for more information.
@@ -286,9 +302,13 @@ See :ref:`type-narrowing` for more information.
 Invariance vs covariance
 ------------------------
 
-Most mutable generic collections are invariant, and mypy considers all
-user-defined generic classes invariant by default
-(see :ref:`variance-of-generics` for motivation). This could lead to some
+Most mutable generic collections are invariant. When using the legacy
+``TypeVar`` syntax, mypy considers all user-defined generic classes invariant
+by default (see :ref:`variance-of-generics` for motivation). When using the
+:pep:`695` syntax (``class MyClass[T]: ...``), variance is inferred from
+usage rather than defaulting to invariant.
+
+The fact that mutable sequences are usually invariant can lead to some
 unexpected errors when combined with type inference. For example:
 
 .. code-block:: python
@@ -296,8 +316,8 @@ unexpected errors when combined with type inference. For example:
    class A: ...
    class B(A): ...
 
-   lst = [A(), A()]  # Inferred type is List[A]
-   new_lst = [B(), B()]  # inferred type is List[B]
+   lst = [A(), A()]  # Inferred type is list[A]
+   new_lst = [B(), B()]  # inferred type is list[B]
    lst = new_lst  # mypy will complain about this, because List is invariant
 
 Possible strategies in such situations are:
@@ -306,7 +326,7 @@ Possible strategies in such situations are:
 
   .. code-block:: python
 
-     new_lst: List[A] = [B(), B()]
+     new_lst: list[A] = [B(), B()]
      lst = new_lst  # OK
 
 * Make a copy of the right hand side:
@@ -319,7 +339,7 @@ Possible strategies in such situations are:
 
   .. code-block:: python
 
-     def f_bad(x: List[A]) -> A:
+     def f_bad(x: list[A]) -> A:
          return x[0]
      f_bad(new_lst) # Fails
 
@@ -363,7 +383,8 @@ explicit type cast:
 
 .. code-block:: python
 
-  from typing import Sequence, cast
+  from collections.abc import Sequence
+  from typing import cast
 
   def find_first_str(a: Sequence[object]) -> str:
       index = next((i for i, s in enumerate(a) if isinstance(s, str)), -1)
@@ -426,8 +447,8 @@ More specifically, mypy will understand the use of :py:data:`sys.version_info` a
    import sys
 
    # Distinguishing between different versions of Python:
-   if sys.version_info >= (3, 8):
-       # Python 3.8+ specific definitions and imports
+   if sys.version_info >= (3, 13):
+       # Python 3.13+ specific definitions and imports
    else:
        # Other definitions and imports
 
@@ -454,7 +475,7 @@ Example:
    # The rest of this file doesn't apply to Windows.
 
 Some other expressions exhibit similar behavior; in particular,
-:py:data:`~typing.TYPE_CHECKING`, variables named ``MYPY``, and any variable
+:py:data:`~typing.TYPE_CHECKING`, variables named ``MYPY`` or ``TYPE_CHECKING``, and any variable
 whose name is passed to :option:`--always-true <mypy --always-true>` or :option:`--always-false <mypy --always-false>`.
 (However, ``True`` and ``False`` are not treated specially!)
 
@@ -489,7 +510,7 @@ understand how mypy handles a particular piece of code. Example:
 
 .. code-block:: python
 
-   reveal_type((1, 'hello'))  # Revealed type is "Tuple[builtins.int, builtins.str]"
+   reveal_type((1, 'hello'))  # Revealed type is "tuple[builtins.int, builtins.str]"
 
 You can also use ``reveal_locals()`` at any line in a file
 to see the types of all local variables at once. Example:
@@ -504,11 +525,15 @@ to see the types of all local variables at once. Example:
    #     b: builtins.str
 .. note::
 
-   ``reveal_type`` and ``reveal_locals`` are only understood by mypy and
-   don't exist in Python. If you try to run your program, you'll have to
-   remove any ``reveal_type`` and ``reveal_locals`` calls before you can
-   run your code. Both are always available and you don't need to import
-   them.
+    ``reveal_type`` and ``reveal_locals`` are handled specially by mypy during
+    type checking, and don't have to be defined or imported.
+
+    However, if you want to run your code,
+    you'll have to remove any ``reveal_type`` and ``reveal_locals``
+    calls from your program or else Python will give you an error at runtime.
+
+    Alternatively, you can import ``reveal_type`` from ``typing_extensions``
+    or ``typing`` (on Python 3.11 and newer)
 
 .. _silencing-linters:
 
@@ -622,16 +647,16 @@ instructions at the `mypyc wheels repo <https://github.com/mypyc/mypy_mypyc-whee
 Variables vs type aliases
 -------------------------
 
-Mypy has both *type aliases* and variables with types like ``Type[...]``. These are
+Mypy has both *type aliases* and variables with types like ``type[...]``. These are
 subtly different, and it's important to understand how they differ to avoid pitfalls.
 
-1. A variable with type ``Type[...]`` is defined using an assignment with an
+1. A variable with type ``type[...]`` is defined using an assignment with an
    explicit type annotation:
 
    .. code-block:: python
 
      class A: ...
-     tp: Type[A] = A
+     tp: type[A] = A
 
 2. You can define a type alias using an assignment without an explicit type annotation
    at the top level of a module:
@@ -645,7 +670,7 @@ subtly different, and it's important to understand how they differ to avoid pitf
 
    .. code-block:: python
 
-     from typing import TypeAlias  # "from typing_extensions" in Python 3.9 and earlier
+     from typing import TypeAlias
 
      class A: ...
      Alias: TypeAlias = A
@@ -670,7 +695,7 @@ can't be defined conditionally (unless using
          # explicit "Type[...]" annotation
          Alias = B
 
-     tp: Type[object]  # "tp" is a variable with a type object value
+     tp: type[object]  # "tp" is a variable with a type object value
      if random() > 0.5:
          tp = A
      else:
@@ -700,7 +725,7 @@ This example demonstrates both safe and unsafe overrides:
 
 .. code-block:: python
 
-    from typing import Sequence, List, Iterable
+    from collections.abc import Sequence, Iterable
 
     class A:
         def test(self, t: Sequence[int]) -> Sequence[str]:
@@ -713,12 +738,12 @@ This example demonstrates both safe and unsafe overrides:
 
     class NarrowerArgument(A):
         # A more specific argument type isn't accepted
-        def test(self, t: List[int]) -> Sequence[str]:  # Error
+        def test(self, t: list[int]) -> Sequence[str]:  # Error
             ...
 
     class NarrowerReturn(A):
         # A more specific return type is fine
-        def test(self, t: Sequence[int]) -> List[str]:  # OK
+        def test(self, t: Sequence[int]) -> list[str]:  # OK
             ...
 
     class GeneralizedReturn(A):
@@ -733,7 +758,7 @@ not necessary:
 .. code-block:: python
 
     class NarrowerArgument(A):
-        def test(self, t: List[int]) -> Sequence[str]:  # type: ignore[override]
+        def test(self, t: list[int]) -> Sequence[str]:  # type: ignore[override]
             ...
 
 .. _unreachable:
@@ -756,7 +781,7 @@ type check such code. Consider this example:
         x: int = 'abc'  # Unreachable -- no error
 
 It's easy to see that any statement after ``return`` is unreachable,
-and hence mypy will not complain about the mis-typed code below
+and hence mypy will not complain about the mistyped code below
 it. For a more subtle example, consider this code:
 
 .. code-block:: python
@@ -802,7 +827,7 @@ This is best understood via an example:
 
 .. code-block:: python
 
-    def foo(x: Optional[int]) -> Callable[[], int]:
+    def foo(x: int | None) -> Callable[[], int]:
         if x is None:
             x = 5
         print(x + 1)  # mypy correctly deduces x must be an int here
@@ -818,3 +843,30 @@ This is best understood via an example:
 To get this code to type check, you could assign ``y = x`` after ``x`` has been
 narrowed, and use ``y`` in the inner function, or add an assert in the inner
 function.
+
+.. _incorrect-self:
+
+Incorrect use of ``Self``
+-------------------------
+
+``Self`` is not the type of the current class; it's a type variable with upper
+bound of the current class. That is, it represents the type of the current class
+or of potential subclasses.
+
+.. code-block:: python
+
+    from typing import Self
+
+    class Foo:
+        @classmethod
+        def constructor(cls) -> Self:
+            # Instead, either call cls() or change the annotation to -> Foo
+            return Foo()  # error: Incompatible return value type (got "Foo", expected "Self")
+
+    class Bar(Foo):
+        ...
+
+    reveal_type(Foo.constructor())  # note: Revealed type is "Foo"
+    # In the context of the subclass Bar, the Self return type promises
+    # that the return value will be Bar
+    reveal_type(Bar.constructor())  # note: Revealed type is "Bar"

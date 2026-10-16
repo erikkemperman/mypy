@@ -2,14 +2,13 @@ import sys
 import unittest.case
 from _typeshed import OptExcInfo
 from collections.abc import Callable
-from typing import Any, TextIO, TypeVar
-from typing_extensions import TypeAlias
+from typing import Any, Final, TextIO, TypeAlias, TypeVar
 
 _F = TypeVar("_F", bound=Callable[..., Any])
 _DurationsType: TypeAlias = list[tuple[str, float]]
 
-STDOUT_LINE: str
-STDERR_LINE: str
+STDOUT_LINE: Final[str]
+STDERR_LINE: Final[str]
 
 # undocumented
 def failfast(method: _F) -> _F: ...

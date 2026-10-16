@@ -7,7 +7,6 @@ to enable fine-grained incremental reprocessing of changes.
 from __future__ import annotations
 
 import argparse
-import base64
 import io
 import json
 import os
@@ -16,9 +15,11 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Callable, Sequence, Set as AbstractSet
 from contextlib import redirect_stderr, redirect_stdout
-from typing import AbstractSet, Any, Callable, Final, List, Sequence, Tuple
-from typing_extensions import TypeAlias as _TypeAlias
+from typing import Any, Final, TypeAlias as _TypeAlias
+
+from librt.base64 import b64encode
 
 import mypy.build
 import mypy.errors
@@ -57,7 +58,7 @@ if sys.platform == "win32":
         """
         command = [sys.executable, "-m", "mypy.dmypy", "--status-file", status_file, "daemon"]
         pickled_options = pickle.dumps(options.snapshot())
-        command.append(f'--options-data="{base64.b64encode(pickled_options).decode()}"')
+        command.append(f'--options-data="{b64encode(pickled_options).decode()}"')
         if timeout:
             command.append(f"--timeout={timeout}")
         if log_file:
@@ -150,6 +151,8 @@ def process_start_options(flags: list[str], allow_sources: bool) -> Options:
         sys.exit("dmypy: start/restart should not disable incremental mode")
     if options.follow_imports not in ("skip", "error", "normal"):
         sys.exit("dmypy: follow-imports=silent not supported")
+    if not options.local_partial_types:
+        sys.exit("dmypy: disabling local-partial-types not supported")
     return options
 
 
@@ -161,9 +164,9 @@ def ignore_suppressed_imports(module: str) -> bool:
     return module.startswith("encodings.")
 
 
-ModulePathPair: _TypeAlias = Tuple[str, str]
-ModulePathPairs: _TypeAlias = List[ModulePathPair]
-ChangesAndRemovals: _TypeAlias = Tuple[ModulePathPairs, ModulePathPairs]
+ModulePathPair: _TypeAlias = tuple[str, str]
+ModulePathPairs: _TypeAlias = list[ModulePathPair]
+ChangesAndRemovals: _TypeAlias = tuple[ModulePathPairs, ModulePathPairs]
 
 
 class Server:
@@ -189,13 +192,17 @@ class Server:
         options.show_traceback = True
         if options.use_fine_grained_cache:
             # Using fine_grained_cache implies generating and caring
-            # about the fine grained cache
+            # about the fine-grained cache.
             options.cache_fine_grained = True
         else:
             options.cache_dir = os.devnull
         # Fine-grained incremental doesn't support general partial types
         # (details in https://github.com/python/mypy/issues/4492)
         options.local_partial_types = True
+        # We don't support parallel checking in fine-grained mode yet.
+        # Ignore it for now, so that same config file can be used with
+        # mypy and with the daemon.
+        options.num_workers = 0
         self.status_file = status_file
 
         # Since the object is created in the parent process we can check
@@ -383,6 +390,9 @@ class Server:
             removals = set(remove)
             sources = [s for s in sources if s.path and s.path not in removals]
         if update:
+            # Sort list of file updates by extension, so *.pyi files are first.
+            update.sort(key=lambda f: os.path.splitext(f)[1], reverse=True)
+
             known = {s.path for s in sources if s.path}
             added = [p for p in update if p not in known]
             try:
@@ -616,12 +626,17 @@ class Server:
         t1 = time.time()
         manager.log(f"fine-grained increment: find_changed: {t1 - t0:.3f}s")
 
+        # Track all modules encountered so far. New entries for all dependencies
+        # are added below by other module finding methods below. All dependencies
+        # in graph but not in `seen` are considered deleted at the end of this method.
         seen = {source.module for source in sources}
 
         # Find changed modules reachable from roots (or in roots) already in graph.
         changed, new_files = self.find_reachable_changed_modules(
             sources, graph, seen, changed_paths
         )
+        # Same as in fine_grained_increment().
+        self.add_explicitly_new(sources, changed)
         if explicit_export_types:
             # Same as in fine_grained_increment().
             add_all_sources_to_changed(sources, changed)
@@ -709,7 +724,7 @@ class Server:
             find_changes_time=t1 - t0,
             fg_update_time=t2 - t1,
             refresh_suppressed_time=t3 - t2,
-            find_added_supressed_time=t4 - t3,
+            find_added_suppressed_time=t4 - t3,
             cleanup_time=t5 - t4,
         )
 
@@ -730,7 +745,9 @@ class Server:
         Args:
             roots: modules where to start search from
             graph: module graph to use for the search
-            seen: modules we've seen before that won't be visited (mutated here!!)
+            seen: modules we've seen before that won't be visited (mutated here!!).
+                  Needed to accumulate all modules encountered during update and remove
+                  everything that no longer exists.
             changed_paths: which paths have changed (stop search here and return any found)
 
         Return (encountered reachable changed modules,
@@ -750,7 +767,8 @@ class Server:
                 changed.append((nxt.module, nxt.path))
             elif nxt.module in graph:
                 state = graph[nxt.module]
-                for dep in state.dependencies:
+                ancestors = state.ancestors or []
+                for dep in state.dependencies + ancestors:
                     if dep not in seen:
                         seen.add(dep)
                         worklist.append(BuildSource(graph[dep].path, graph[dep].id, followed=True))
@@ -769,7 +787,9 @@ class Server:
         """Find suppressed modules that have been added (and not included in seen).
 
         Args:
-            seen: reachable modules we've seen before (mutated here!!)
+            seen: reachable modules we've seen before (mutated here!!).
+                  Needed to accumulate all modules encountered during update and remove
+                  everything that no longer exists.
 
         Return suppressed, added modules.
         """
@@ -885,6 +905,22 @@ class Server:
             assert path
             removed.append((source.module, path))
 
+        self.add_explicitly_new(sources, changed)
+
+        # Find anything that has had its module path change because of added or removed __init__s
+        last = {s.path: s.module for s in self.previous_sources}
+        for s in sources:
+            assert s.path
+            if s.path in last and last[s.path] != s.module:
+                # Mark it as removed from its old name and changed at its new name
+                removed.append((last[s.path], s.path))
+                changed.append((s.module, s.path))
+
+        return changed, removed
+
+    def add_explicitly_new(
+        self, sources: list[BuildSource], changed: list[tuple[str, str]]
+    ) -> None:
         # Always add modules that were (re-)added, since they may be detected as not changed by
         # fswatcher (if they were actually not changed), but they may still need to be checked
         # in case they had errors before they were deleted from sources on previous runs.
@@ -899,17 +935,6 @@ class Server:
                 and (source.module, source.path) not in changed_set
             ]
         )
-
-        # Find anything that has had its module path change because of added or removed __init__s
-        last = {s.path: s.module for s in self.previous_sources}
-        for s in sources:
-            assert s.path
-            if s.path in last and last[s.path] != s.module:
-                # Mark it as removed from its old name and changed at its new name
-                removed.append((last[s.path], s.path))
-                changed.append((s.module, s.path))
-
-        return changed, removed
 
     def cmd_inspect(
         self,

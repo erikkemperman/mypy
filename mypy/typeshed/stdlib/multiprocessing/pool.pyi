@@ -1,11 +1,8 @@
-import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from types import TracebackType
-from typing import Any, Generic, Literal, TypeVar
+from multiprocessing.context import DefaultContext, Process as _Process
+from types import GenericAlias, TracebackType
+from typing import Any, Final, Generic, TypeVar
 from typing_extensions import Self
-
-if sys.version_info >= (3, 9):
-    from types import GenericAlias
 
 __all__ = ["Pool", "ThreadPool"]
 
@@ -20,8 +17,7 @@ class ApplyResult(Generic[_T]):
     def wait(self, timeout: float | None = None) -> None: ...
     def ready(self) -> bool: ...
     def successful(self) -> bool: ...
-    if sys.version_info >= (3, 9):
-        def __class_getitem__(cls, item: Any) -> GenericAlias: ...
+    def __class_getitem__(cls, item: Any, /) -> GenericAlias: ...
 
 # alias created during issue #17805
 AsyncResult = ApplyResult
@@ -53,6 +49,8 @@ class Pool:
         maxtasksperchild: int | None = None,
         context: Any | None = None,
     ) -> None: ...
+    @staticmethod
+    def Process(ctx: DefaultContext, *args: Any, **kwds: Any) -> _Process: ...
     def apply(self, func: Callable[..., _T], args: Iterable[Any] = (), kwds: Mapping[str, Any] = {}) -> _T: ...
     def apply_async(
         self,
@@ -97,7 +95,7 @@ class ThreadPool(Pool):
     ) -> None: ...
 
 # undocumented
-INIT: Literal["INIT"]
-RUN: Literal["RUN"]
-CLOSE: Literal["CLOSE"]
-TERMINATE: Literal["TERMINATE"]
+INIT: Final = "INIT"
+RUN: Final = "RUN"
+CLOSE: Final = "CLOSE"
+TERMINATE: Final = "TERMINATE"

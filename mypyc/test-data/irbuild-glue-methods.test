@@ -91,7 +91,7 @@ L0:
     r0 = x.foo(y)
     return r0
 
-[case testPropertyDerivedGen]
+[case testPropertyDerivedGen_withgil]
 from typing import Callable
 class BaseProperty:
     @property
@@ -194,18 +194,24 @@ def DerivedProperty.next(self):
     self :: __main__.DerivedProperty
     r0 :: object
     r1 :: int
-    r2, r3, r4 :: object
-    r5 :: int
-    r6 :: __main__.DerivedProperty
+    r2, r3 :: object
+    r4 :: object[1]
+    r5 :: object_ptr
+    r6 :: object
+    r7 :: int
+    r8 :: __main__.DerivedProperty
 L0:
     r0 = self._incr_func
     r1 = self.value
     r2 = self._incr_func
     r3 = box(int, r1)
-    r4 = PyObject_CallFunctionObjArgs(r2, r3, 0)
-    r5 = unbox(int, r4)
-    r6 = DerivedProperty(r0, r5)
-    return r6
+    r4 = [r3]
+    r5 = load_address r4
+    r6 = PyObject_Vectorcall(r2, r5, 1, 0)
+    keep_alive r3
+    r7 = unbox(int, r6)
+    r8 = DerivedProperty(r0, r7)
+    return r8
 def DerivedProperty.next__BaseProperty_glue(__mypyc_self__):
     __mypyc_self__, r0 :: __main__.DerivedProperty
 L0:
@@ -224,24 +230,36 @@ def AgainProperty.next(self):
     self :: __main__.AgainProperty
     r0 :: object
     r1 :: int
-    r2, r3, r4 :: object
-    r5 :: int
-    r6, r7, r8 :: object
-    r9 :: int
-    r10 :: __main__.AgainProperty
+    r2, r3 :: object
+    r4 :: object[1]
+    r5 :: object_ptr
+    r6 :: object
+    r7 :: int
+    r8, r9 :: object
+    r10 :: object[1]
+    r11 :: object_ptr
+    r12 :: object
+    r13 :: int
+    r14 :: __main__.AgainProperty
 L0:
     r0 = self._incr_func
     r1 = self.value
     r2 = self._incr_func
     r3 = box(int, r1)
-    r4 = PyObject_CallFunctionObjArgs(r2, r3, 0)
-    r5 = unbox(int, r4)
-    r6 = self._incr_func
-    r7 = box(int, r5)
-    r8 = PyObject_CallFunctionObjArgs(r6, r7, 0)
-    r9 = unbox(int, r8)
-    r10 = AgainProperty(r0, r9)
-    return r10
+    r4 = [r3]
+    r5 = load_address r4
+    r6 = PyObject_Vectorcall(r2, r5, 1, 0)
+    keep_alive r3
+    r7 = unbox(int, r6)
+    r8 = self._incr_func
+    r9 = box(int, r7)
+    r10 = [r9]
+    r11 = load_address r10
+    r12 = PyObject_Vectorcall(r8, r11, 1, 0)
+    keep_alive r9
+    r13 = unbox(int, r12)
+    r14 = AgainProperty(r0, r13)
+    return r14
 def AgainProperty.next__DerivedProperty_glue(__mypyc_self__):
     __mypyc_self__, r0 :: __main__.AgainProperty
 L0:
@@ -435,3 +453,59 @@ class EE(E):
 main:7: error: An argument with type "i64" cannot be given a default value in a method override
 main:13: error: Incompatible argument type "i64" (base class has type "int")
 main:18: error: Incompatible argument type "int" (base class has type "i64")
+
+[case testPropertySetterShadowGlue]
+import mypy_extensions
+
+@mypy_extensions.mypyc_attr(allow_interpreted_subclasses=True)
+class Base:
+    _x: str = ""
+
+    @property
+    def x(self) -> str:
+        return self._x
+
+    @x.setter
+    def x(self, v: str) -> None:
+        self._x = v
+[out]
+def Base.x(self):
+    self :: __main__.Base
+    r0 :: str
+L0:
+    r0 = self._x
+    return r0
+def Base.x__Base_glue(__mypyc_self__):
+    __mypyc_self__ :: __main__.Base
+    r0 :: str
+    r1 :: object
+    r2 :: str
+L0:
+    r0 = 'x'
+    r1 = CPyObject_GetAttr(__mypyc_self__, r0)
+    r2 = cast(str, r1)
+    return r2
+def Base.__mypyc_setter__x(self, v):
+    self :: __main__.Base
+    v :: str
+    r0 :: bool
+L0:
+    self._x = v; r0 = is_error
+    return 1
+def Base.__mypyc_setter__x__Base_glue(self, v):
+    self :: __main__.Base
+    v, r0 :: str
+    r1 :: i32
+    r2 :: bit
+L0:
+    r0 = 'x'
+    r1 = PyObject_SetAttr(self, r0, v)
+    r2 = r1 >= 0 :: signed
+    return 1
+def Base.__mypyc_defaults_setup(__mypyc_self__):
+    __mypyc_self__ :: __main__.Base
+    r0 :: str
+L0:
+    r0 = ''
+    __mypyc_self__._x = r0
+    return 1

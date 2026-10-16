@@ -13,7 +13,8 @@ instance of the callable class.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import NamedTuple, Sequence
+from collections.abc import Sequence
+from typing import NamedTuple
 
 from mypy.nodes import (
     ArgKind,
@@ -24,12 +25,11 @@ from mypy.nodes import (
     FuncItem,
     LambdaExpr,
     OverloadedFuncDef,
-    SymbolNode,
     TypeInfo,
     Var,
 )
-from mypy.types import CallableType, get_proper_type
-from mypyc.common import LAMBDA_NAME, PROPSET_PREFIX, SELF_NAME
+from mypy.types import CallableType, Type, UnboundType, get_proper_type
+from mypyc.common import FAST_PREFIX, LAMBDA_NAME, PROPSET_PREFIX, SELF_NAME, UNDECORATED_PREFIX
 from mypyc.ir.class_ir import ClassIR, NonExtClassInfo
 from mypyc.ir.func_ir import (
     FUNC_CLASSMETHOD,
@@ -42,10 +42,10 @@ from mypyc.ir.func_ir import (
 )
 from mypyc.ir.ops import (
     BasicBlock,
+    ComparisonOp,
     GetAttr,
-    InitStatic,
     Integer,
-    LoadAddress,
+    LoadErrorValue,
     LoadLiteral,
     Register,
     Return,
@@ -57,46 +57,48 @@ from mypyc.ir.ops import (
 from mypyc.ir.rtypes import (
     RInstance,
     bool_rprimitive,
+    c_int_rprimitive,
     dict_rprimitive,
     int_rprimitive,
     object_rprimitive,
 )
-from mypyc.irbuild.builder import IRBuilder, SymbolTarget, gen_arg_defaults
+from mypyc.irbuild.builder import IRBuilder, calculate_arg_defaults, gen_arg_defaults
 from mypyc.irbuild.callable_class import (
     add_call_to_callable_class,
     add_get_to_callable_class,
     instantiate_callable_class,
     setup_callable_class,
 )
-from mypyc.irbuild.context import FuncInfo, ImplicitClass
+from mypyc.irbuild.context import FuncInfo, GeneratorClass
 from mypyc.irbuild.env_class import (
+    add_vars_to_env,
     finalize_env_class,
     load_env_registers,
-    load_outer_envs,
     setup_env_class,
-    setup_func_for_recursive_call,
 )
-from mypyc.irbuild.generator import (
-    add_methods_to_generator_class,
-    add_raise_exception_blocks_to_generator_class,
-    create_switch_for_generator_class,
-    gen_generator_func,
-    populate_switch_for_generator_class,
-    setup_env_for_generator_class,
-)
+from mypyc.irbuild.generator import gen_generator_func, gen_generator_func_body
 from mypyc.irbuild.targets import AssignmentTarget
-from mypyc.irbuild.util import is_constant
-from mypyc.primitives.dict_ops import dict_get_method_with_none, dict_new_op, dict_set_item_op
-from mypyc.primitives.generic_ops import py_setattr_op
+from mypyc.irbuild.util import get_func_target_symbol
+from mypyc.primitives.dict_ops import (
+    dict_get_method_with_none,
+    dict_new_op,
+    exact_dict_set_item_op,
+)
+from mypyc.primitives.generic_ops import (
+    generic_getattr,
+    generic_setattr,
+    py_get_item_op,
+    py_setattr_op,
+)
 from mypyc.primitives.misc_ops import register_function
-from mypyc.primitives.registry import builtin_names
 from mypyc.sametype import is_same_method_signature, is_same_type
 
 # Top-level transform functions
 
 
 def transform_func_def(builder: IRBuilder, fdef: FuncDef) -> None:
-    func_ir, func_reg = gen_func_item(builder, fdef, fdef.name, builder.mapper.fdef_to_sig(fdef))
+    sig = builder.mapper.fdef_to_sig(fdef, builder.options.strict_dunders_typing)
+    func_ir, func_reg = gen_func_item(builder, fdef, fdef.name, sig)
 
     # If the function that was visited was a nested function, then either look it up in our
     # current environment or define it if it was not already defined.
@@ -113,9 +115,8 @@ def transform_overloaded_func_def(builder: IRBuilder, o: OverloadedFuncDef) -> N
 
 
 def transform_decorator(builder: IRBuilder, dec: Decorator) -> None:
-    func_ir, func_reg = gen_func_item(
-        builder, dec.func, dec.func.name, builder.mapper.fdef_to_sig(dec.func)
-    )
+    sig = builder.mapper.fdef_to_sig(dec.func, builder.options.strict_dunders_typing)
+    func_ir, func_reg = gen_func_item(builder, dec.func, dec.func.name, sig)
     decorated_func: Value | None = None
     if func_reg:
         decorated_func = load_decorated_func(builder, dec.func, func_reg)
@@ -134,7 +135,7 @@ def transform_decorator(builder: IRBuilder, dec: Decorator) -> None:
     if decorated_func is not None:
         # Set the callable object representing the decorated function as a global.
         builder.call_c(
-            dict_set_item_op,
+            exact_dict_set_item_op,
             [builder.load_globals_dict(), builder.load_str(dec.func.name), decorated_func],
             decorated_func.line,
         )
@@ -146,7 +147,7 @@ def transform_decorator(builder: IRBuilder, dec: Decorator) -> None:
 
 def transform_lambda_expr(builder: IRBuilder, expr: LambdaExpr) -> Value:
     typ = get_proper_type(builder.types[expr])
-    assert isinstance(typ, CallableType)
+    assert isinstance(typ, CallableType), typ
 
     runtime_args = []
     for arg, arg_type in zip(expr.arguments, typ.arg_types):
@@ -176,6 +177,7 @@ def gen_func_item(
     name: str,
     sig: FuncSignature,
     cdef: ClassDef | None = None,
+    make_ext_method: bool = False,
 ) -> tuple[FuncIR, Value | None]:
     """Generate and return the FuncIR for a given FuncDef.
 
@@ -227,104 +229,79 @@ def gen_func_item(
     class_name = None
     if cdef:
         ir = builder.mapper.type_to_ir[cdef.info]
-        in_non_ext = not ir.is_ext_class
+        in_non_ext = not ir.is_ext_class and not make_ext_method
         class_name = cdef.name
 
     if is_singledispatch:
         func_name = singledispatch_main_func_name(name)
     else:
         func_name = name
-    builder.enter(
-        FuncInfo(
-            fitem=fitem,
-            name=func_name,
-            class_name=class_name,
-            namespace=gen_func_ns(builder),
-            is_nested=is_nested,
-            contains_nested=contains_nested,
-            is_decorated=is_decorated,
-            in_non_ext=in_non_ext,
-            add_nested_funcs_to_env=add_nested_funcs_to_env,
-        )
-    )
 
-    # Functions that contain nested functions need an environment class to store variables that
-    # are free in their nested functions. Generator functions need an environment class to
-    # store a variable denoting the next instruction to be executed when the __next__ function
-    # is called, along with all the variables inside the function itself.
-    if builder.fn_info.contains_nested or builder.fn_info.is_generator:
+    fn_info = FuncInfo(
+        fitem=fitem,
+        name=func_name,
+        class_name=class_name,
+        namespace=gen_func_ns(builder),
+        is_nested=is_nested,
+        contains_nested=contains_nested,
+        is_decorated=is_decorated,
+        in_non_ext=in_non_ext,
+        add_nested_funcs_to_env=add_nested_funcs_to_env,
+    )
+    is_generator = fn_info.is_generator
+    builder.enter(fn_info, ret_type=sig.ret_type)
+
+    if is_generator:
+        fitem = builder.fn_info.fitem
+        assert isinstance(fitem, FuncDef), fitem
+        generator_class_ir = builder.mapper.fdef_to_generator[fitem]
+        builder.fn_info.generator_class = GeneratorClass(generator_class_ir)
+
+    # Functions that contain nested functions need an environment class to store captured
+    # variables. A generator also needs a separate environment class when it is nested or its
+    # generated class is non-final.
+    if contains_nested or (
+        is_generator and not builder.fn_info.can_merge_generator_and_env_classes()
+    ):
         setup_env_class(builder)
 
-    if builder.fn_info.is_nested or builder.fn_info.in_non_ext:
+    if is_nested or in_non_ext:
         setup_callable_class(builder)
 
-    if builder.fn_info.is_generator:
-        # Do a first-pass and generate a function that just returns a generator object.
-        gen_generator_func(builder)
-        args, _, blocks, ret_type, fn_info = builder.leave()
-        func_ir, func_reg = gen_func_ir(
-            builder, args, blocks, sig, fn_info, cdef, is_singledispatch
+    if is_generator:
+        # First generate a function that just constructs and returns a generator object.
+        func_ir, func_reg = gen_generator_func(
+            builder,
+            lambda args, blocks, fn_info: gen_func_ir(
+                builder, args, blocks, sig, fn_info, cdef, is_singledispatch
+            ),
         )
 
         # Re-enter the FuncItem and visit the body of the function this time.
-        builder.enter(fn_info)
-        setup_env_for_generator_class(builder)
-        load_outer_envs(builder, builder.fn_info.generator_class)
-        top_level = builder.top_level_fn_info()
-        if (
-            builder.fn_info.is_nested
-            and isinstance(fitem, FuncDef)
-            and top_level
-            and top_level.add_nested_funcs_to_env
-        ):
-            setup_func_for_recursive_call(builder, fitem, builder.fn_info.generator_class)
-        create_switch_for_generator_class(builder)
-        add_raise_exception_blocks_to_generator_class(builder, fitem.line)
+        gen_generator_func_body(builder, fn_info, func_reg)
     else:
-        load_env_registers(builder)
-        gen_arg_defaults(builder)
+        func_ir, func_reg = gen_func_body(builder, sig, cdef, is_singledispatch)
 
-    if builder.fn_info.contains_nested and not builder.fn_info.is_generator:
+    if is_singledispatch:
+        # add the generated main singledispatch function
+        builder.functions.append(func_ir)
+        # create the dispatch function
+        assert isinstance(fitem, FuncDef), fitem
+        return gen_dispatch_func_ir(builder, fitem, fn_info.name, name, sig)
+
+    return func_ir, func_reg
+
+
+def gen_func_body(
+    builder: IRBuilder, sig: FuncSignature, cdef: ClassDef | None, is_singledispatch: bool
+) -> tuple[FuncIR, Value | None]:
+    load_env_registers(builder)
+    gen_arg_defaults(builder)
+    if builder.fn_info.contains_nested:
         finalize_env_class(builder)
-
-    builder.ret_types[-1] = sig.ret_type
-
-    # Add all variables and functions that are declared/defined within this
-    # function and are referenced in functions nested within this one to this
-    # function's environment class so the nested functions can reference
-    # them even if they are declared after the nested function's definition.
-    # Note that this is done before visiting the body of this function.
-
-    env_for_func: FuncInfo | ImplicitClass = builder.fn_info
-    if builder.fn_info.is_generator:
-        env_for_func = builder.fn_info.generator_class
-    elif builder.fn_info.is_nested or builder.fn_info.in_non_ext:
-        env_for_func = builder.fn_info.callable_class
-
-    if builder.fn_info.fitem in builder.free_variables:
-        # Sort the variables to keep things deterministic
-        for var in sorted(builder.free_variables[builder.fn_info.fitem], key=lambda x: x.name):
-            if isinstance(var, Var):
-                rtype = builder.type_to_rtype(var.type)
-                builder.add_var_to_env_class(var, rtype, env_for_func, reassign=False)
-
-    if builder.fn_info.fitem in builder.encapsulating_funcs:
-        for nested_fn in builder.encapsulating_funcs[builder.fn_info.fitem]:
-            if isinstance(nested_fn, FuncDef):
-                # The return type is 'object' instead of an RInstance of the
-                # callable class because differently defined functions with
-                # the same name and signature across conditional blocks
-                # will generate different callable classes, so the callable
-                # class that gets instantiated must be generic.
-                builder.add_var_to_env_class(
-                    nested_fn, object_rprimitive, env_for_func, reassign=False
-                )
-
-    builder.accept(fitem.body)
+    add_vars_to_env(builder)
+    builder.accept(builder.fn_info.fitem.body)
     builder.maybe_add_implicit_return()
-
-    if builder.fn_info.is_generator:
-        populate_switch_for_generator_class(builder)
 
     # Hang on to the local symbol table for a while, since we use it
     # to calculate argument defaults below.
@@ -332,24 +309,11 @@ def gen_func_item(
 
     args, _, blocks, ret_type, fn_info = builder.leave()
 
-    if fn_info.is_generator:
-        add_methods_to_generator_class(builder, fn_info, sig, args, blocks, fitem.is_coroutine)
-    else:
-        func_ir, func_reg = gen_func_ir(
-            builder, args, blocks, sig, fn_info, cdef, is_singledispatch
-        )
+    func_ir, func_reg = gen_func_ir(builder, args, blocks, sig, fn_info, cdef, is_singledispatch)
 
     # Evaluate argument defaults in the surrounding scope, since we
     # calculate them *once* when the function definition is evaluated.
     calculate_arg_defaults(builder, fn_info, func_reg, symtable)
-
-    if is_singledispatch:
-        # add the generated main singledispatch function
-        builder.functions.append(func_ir)
-        # create the dispatch function
-        assert isinstance(fitem, FuncDef)
-        return gen_dispatch_func_ir(builder, fitem, fn_info.name, name, sig)
-
     return func_ir, func_reg
 
 
@@ -389,8 +353,12 @@ def gen_func_ir(
         add_get_to_callable_class(builder, fn_info)
         func_reg = instantiate_callable_class(builder, fn_info)
     else:
-        assert isinstance(fn_info.fitem, FuncDef)
-        func_decl = builder.mapper.func_to_decl[fn_info.fitem]
+        fitem = fn_info.fitem
+        assert isinstance(fitem, FuncDef), fitem
+        func_decl = builder.mapper.func_to_decl[fitem]
+        if cdef and fn_info.name == FAST_PREFIX + func_decl.name:
+            # Special-cased version of a method has a separate FuncDecl, use that one.
+            func_decl = builder.mapper.type_to_ir[cdef.info].method_decls[fn_info.name]
         if fn_info.is_decorated or is_singledispatch_main_func:
             class_name = None if cdef is None else cdef.name
             func_decl = FuncDecl(
@@ -399,40 +367,161 @@ def gen_func_ir(
                 builder.module_name,
                 sig,
                 func_decl.kind,
-                func_decl.is_prop_getter,
-                func_decl.is_prop_setter,
+                is_prop_getter=func_decl.is_prop_getter,
+                is_prop_setter=func_decl.is_prop_setter,
+                is_generator=func_decl.is_generator,
+                is_coroutine=func_decl.is_coroutine,
+                is_final=func_decl.is_final,
+                implicit=func_decl.implicit,
+                internal=func_decl.internal,
             )
-            func_ir = FuncIR(
-                func_decl, args, blocks, fn_info.fitem.line, traceback_name=fn_info.fitem.name
-            )
+            func_ir = FuncIR(func_decl, args, blocks, fitem.line, traceback_name=fitem.name)
         else:
-            func_ir = FuncIR(
-                func_decl, args, blocks, fn_info.fitem.line, traceback_name=fn_info.fitem.name
-            )
+            func_ir = FuncIR(func_decl, args, blocks, fitem.line, traceback_name=fitem.name)
     return (func_ir, func_reg)
+
+
+def generate_getattr_wrapper(builder: IRBuilder, cdef: ClassDef, getattr: FuncDef) -> None:
+    """
+    Generate a wrapper function for __getattr__ that can be put into the tp_getattro slot.
+    The wrapper takes one argument besides self which is the attribute name.
+    It first checks if the name matches any of the attributes of this class.
+    If it does, it returns that attribute. If none match, it calls __getattr__.
+
+    __getattr__ is not supported in classes that allow interpreted subclasses because the
+    tp_getattro slot is inherited by subclasses and if the subclass overrides __getattr__,
+    the override would be ignored in our wrapper. TODO: To support this, the wrapper would
+    have to check type of self and if it's not the compiled class, resolve "__getattr__" against
+    the type at runtime and call the returned method, like _Py_slot_tp_getattr_hook in cpython.
+
+    __getattr__ is not supported in classes which inherit from non-native classes because those
+    have __dict__ which currently has some strange interactions when class attributes and
+    variables are assigned through __dict__ vs. through regular attribute access. Allowing
+    __getattr__ on top of that could be problematic.
+    """
+    name = getattr.name + "__wrapper"
+    ir = builder.mapper.type_to_ir[cdef.info]
+    line = getattr.line
+
+    error_base = f'"__getattr__" not supported in class "{cdef.name}" because '
+    if ir.allow_interpreted_subclasses:
+        builder.error(error_base + "it allows interpreted subclasses", line)
+    if ir.inherits_python:
+        builder.error(error_base + "it inherits from a non-native class", line)
+
+    with builder.enter_method(ir, name, object_rprimitive, internal=True):
+        attr_arg = builder.add_argument("attr", object_rprimitive)
+        generic_getattr_result = builder.call_c(generic_getattr, [builder.self(), attr_arg], line)
+
+        return_generic, call_getattr = BasicBlock(), BasicBlock()
+        null = Integer(0, object_rprimitive, line)
+        got_generic = builder.add(
+            ComparisonOp(generic_getattr_result, null, ComparisonOp.NEQ, line)
+        )
+        builder.add_bool_branch(got_generic, return_generic, call_getattr)
+
+        builder.activate_block(return_generic)
+        builder.add(Return(generic_getattr_result, line))
+
+        builder.activate_block(call_getattr)
+        # No attribute matched so call user-provided __getattr__.
+        getattr_result = builder.gen_method_call(
+            builder.self(), getattr.name, [attr_arg], object_rprimitive, line
+        )
+        builder.add(Return(getattr_result, line))
+
+
+def generate_setattr_wrapper(builder: IRBuilder, cdef: ClassDef, setattr: FuncDef) -> None:
+    """
+    Generate a wrapper function for __setattr__ that can be put into the tp_setattro slot.
+    The wrapper takes two arguments besides self - attribute name and the new value.
+    Returns 0 on success and -1 on failure. Restrictions are similar to the __getattr__
+    wrapper above.
+
+    The wrapper calls the user-defined __setattr__ when the value to set is not NULL.
+    When it's NULL, this means that the call to tp_setattro comes from a del statement,
+    so it calls __delattr__ instead. If __delattr__ is not overridden in the native class,
+    this will call the base implementation in object which doesn't work without __dict__.
+    """
+    name = setattr.name + "__wrapper"
+    ir = builder.mapper.type_to_ir[cdef.info]
+    line = setattr.line
+
+    error_base = f'"__setattr__" not supported in class "{cdef.name}" because '
+    if ir.allow_interpreted_subclasses:
+        builder.error(error_base + "it allows interpreted subclasses", line)
+    if ir.inherits_python:
+        builder.error(error_base + "it inherits from a non-native class", line)
+
+    with builder.enter_method(ir, name, c_int_rprimitive, internal=True):
+        attr_arg = builder.add_argument("attr", object_rprimitive)
+        value_arg = builder.add_argument("value", object_rprimitive)
+
+        call_delattr, call_setattr = BasicBlock(), BasicBlock()
+        null = Integer(0, object_rprimitive, line)
+        is_delattr = builder.add(ComparisonOp(value_arg, null, ComparisonOp.EQ, line))
+        builder.add_bool_branch(is_delattr, call_delattr, call_setattr)
+
+        builder.activate_block(call_delattr)
+        delattr_symbol = cdef.info.get("__delattr__")
+        delattr = delattr_symbol.node if delattr_symbol else None
+        delattr_override = delattr is not None and not delattr.fullname.startswith("builtins.")
+        if delattr_override:
+            builder.gen_method_call(builder.self(), "__delattr__", [attr_arg], None, line)
+        else:
+            # Call internal function that cpython normally calls when deleting an attribute.
+            # Cannot call object.__delattr__ here because it calls PyObject_SetAttr internally
+            # which in turn calls our wrapper and recurses infinitely.
+            # Note that since native classes don't have __dict__, this will raise AttributeError
+            # for dynamic attributes.
+            builder.call_c(generic_setattr, [builder.self(), attr_arg, null], line)
+        builder.add(Return(Integer(0, c_int_rprimitive), line))
+
+        builder.activate_block(call_setattr)
+        builder.gen_method_call(builder.self(), setattr.name, [attr_arg, value_arg], None, line)
+        builder.add(Return(Integer(0, c_int_rprimitive), line))
 
 
 def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None:
     # Perform the function of visit_method for methods inside extension classes.
     name = fdef.name
     class_ir = builder.mapper.type_to_ir[cdef.info]
-    func_ir, func_reg = gen_func_item(builder, fdef, name, builder.mapper.fdef_to_sig(fdef), cdef)
+    sig = builder.mapper.fdef_to_sig(fdef, builder.options.strict_dunders_typing)
+    func_ir, func_reg = gen_func_item(builder, fdef, name, sig, cdef)
     builder.functions.append(func_ir)
 
     if is_decorated(builder, fdef):
         # Obtain the function name in order to construct the name of the helper function.
         _, _, name = fdef.fullname.rpartition(".")
-        # Read the PyTypeObject representing the class, get the callable object
-        # representing the non-decorated method
+        # Get the callable representing the non-decorated method directly from the type
+        # dictionary. Attribute access would bind a class method before its decorators are
+        # applied, but the decorators need to receive the unbound function.
         typ = builder.load_native_type_object(cdef.fullname)
-        orig_func = builder.py_get_attr(typ, name, fdef.line)
+        type_dict = builder.py_get_attr(typ, "__dict__", fdef.line)
+        orig_func = builder.primitive_op(
+            py_get_item_op, [type_dict, builder.load_str(name)], fdef.line
+        )
 
         # Decorate the non-decorated method
         decorated_func = load_decorated_func(builder, fdef, orig_func)
 
+        # @classmethod and @staticmethod aren't included in fdefs_to_decorators, since
+        # mypy represents them using the function kind. Reapply the outer descriptor
+        # after the other decorators, matching Python's decorator evaluation order.
+        # TODO: Handle cases where @classmethod/@staticmethod are the inner decorator.
+        # See mypyc#1208 for reference.
+        if func_ir.decl.kind == FUNC_CLASSMETHOD:
+            cls_meth = builder.load_module_attr_by_fullname("builtins.classmethod", fdef.line)
+            decorated_func = builder.py_call(cls_meth, [decorated_func], fdef.line)
+        elif func_ir.decl.kind == FUNC_STATICMETHOD:
+            stat_meth = builder.load_module_attr_by_fullname("builtins.staticmethod", fdef.line)
+            decorated_func = builder.py_call(stat_meth, [decorated_func], fdef.line)
+
         # Set the callable object representing the decorated method as an attribute of the
         # extension class.
-        builder.call_c(py_setattr_op, [typ, builder.load_str(name), decorated_func], fdef.line)
+        builder.primitive_op(
+            py_setattr_op, [typ, builder.load_str(name), decorated_func], fdef.line
+        )
 
     if fdef.is_property:
         # If there is a property setter, it will be processed after the getter,
@@ -448,6 +537,24 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
 
     class_ir.methods[func_ir.decl.name] = func_ir
 
+    # A decorated method that overrides a native method isn't a native method itself,
+    # so native calls to it go through a glue method that calls the decorated attribute
+    # using the Python API. The undecorated method stays in the type dict, since the
+    # decorators are applied to it at runtime.
+    decorated_override = (
+        is_decorated(builder, fdef)
+        and not fdef.is_property
+        and fdef not in builder.prop_setters
+        and name in class_ir.method_decls
+    )
+    if decorated_override:
+        glue = gen_glue_method(builder, func_ir.sig, func_ir, class_ir, class_ir, fdef.line, True)
+        # Native calls are compiled against the method's declaration, so the glue method
+        # takes it over from the undecorated method, which is renamed
+        glue = FuncIR(class_ir.method_decls[name], glue.arg_regs, glue.blocks, fdef.line)
+        builder.functions.append(glue)
+        class_ir.methods[name] = glue
+
     # If this overrides a parent class method with a different type, we need
     # to generate a glue method to mediate between them.
     for base in class_ir.mro[1:]:
@@ -462,7 +569,15 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
             # property setters. Need to make a special glue method for handling this,
             # similar to gen_glue_property.
 
-            f = gen_glue(builder, base.method_decls[name].sig, func_ir, class_ir, base, fdef)
+            f = gen_glue(
+                builder,
+                base.method_decls[name].sig,
+                func_ir,
+                class_ir,
+                base,
+                fdef,
+                do_py_ops=decorated_override,
+            )
             class_ir.glue_methods[(base, name)] = f
             builder.functions.append(f)
 
@@ -472,8 +587,31 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
     # children.
     if class_ir.allow_interpreted_subclasses:
         f = gen_glue(builder, func_ir.sig, func_ir, class_ir, class_ir, fdef, do_py_ops=True)
-        class_ir.glue_methods[(class_ir, name)] = f
+        # Use func_ir.decl.name (unique) rather than fdef.name, because for properties
+        # the getter and setter share the same fdef.name but have distinct decl names
+        # (e.g. "prop" vs "__mypyc_setter__prop"). Using fdef.name would cause the
+        # setter's glue to overwrite the getter's glue in the shadow vtable.
+        class_ir.glue_methods[(class_ir, func_ir.decl.name)] = f
         builder.functions.append(f)
+
+    # Rename the undecorated method only after all glue methods calling it by name exist
+    if decorated_override:
+        func_ir.decl.name = UNDECORATED_PREFIX + name
+        func_ir.decl.internal = False
+        class_ir.methods[func_ir.decl.name] = func_ir
+
+    if fdef.name == "__getattr__":
+        generate_getattr_wrapper(builder, cdef, fdef)
+    elif fdef.name == "__setattr__":
+        generate_setattr_wrapper(builder, cdef, fdef)
+    elif fdef.name == "__delattr__":
+        setattr = cdef.info.get("__setattr__")
+        if not setattr or not setattr.node or setattr.node.fullname.startswith("builtins."):
+            builder.error(
+                '"__delattr__" supported only in classes that also override "__setattr__", '
+                + "or inherit from a native class that overrides it.",
+                fdef.line,
+            )
 
 
 def handle_non_ext_method(
@@ -481,7 +619,8 @@ def handle_non_ext_method(
 ) -> None:
     # Perform the function of visit_method for methods inside non-extension classes.
     name = fdef.name
-    func_ir, func_reg = gen_func_item(builder, fdef, name, builder.mapper.fdef_to_sig(fdef), cdef)
+    sig = builder.mapper.fdef_to_sig(fdef, builder.options.strict_dunders_typing)
+    func_ir, func_reg = gen_func_item(builder, fdef, name, sig, cdef)
     assert func_reg is not None
     builder.functions.append(func_ir)
 
@@ -505,32 +644,14 @@ def handle_non_ext_method(
 
     builder.add_to_non_ext_dict(non_ext, name, func_reg, fdef.line)
 
-
-def calculate_arg_defaults(
-    builder: IRBuilder,
-    fn_info: FuncInfo,
-    func_reg: Value | None,
-    symtable: dict[SymbolNode, SymbolTarget],
-) -> None:
-    """Calculate default argument values and store them.
-
-    They are stored in statics for top level functions and in
-    the function objects for nested functions (while constants are
-    still stored computed on demand).
-    """
-    fitem = fn_info.fitem
-    for arg in fitem.arguments:
-        # Constant values don't get stored but just recomputed
-        if arg.initializer and not is_constant(arg.initializer):
-            value = builder.coerce(
-                builder.accept(arg.initializer), symtable[arg.variable].type, arg.line
-            )
-            if not fn_info.is_nested:
-                name = fitem.fullname + "." + arg.variable.name
-                builder.add(InitStatic(value, name, builder.module_name))
-            else:
-                assert func_reg is not None
-                builder.add(SetAttr(func_reg, arg.variable.name, value, arg.line))
+    # If we identified that this non-extension class method can be special-cased for
+    # direct access during prepare phase, generate a "static" version of it.
+    class_ir = builder.mapper.type_to_ir[cdef.info]
+    name = FAST_PREFIX + fdef.name
+    if name in class_ir.method_decls:
+        func_ir, func_reg = gen_func_item(builder, fdef, name, sig, cdef, make_ext_method=True)
+        class_ir.methods[name] = func_ir
+        builder.functions.append(func_ir)
 
 
 def gen_func_ns(builder: IRBuilder) -> str:
@@ -559,7 +680,7 @@ def load_decorated_func(builder: IRBuilder, fdef: FuncDef, orig_func_reg: Value)
     func_reg = orig_func_reg
     for d in reversed(decorators):
         decorator = d.accept(builder.visitor)
-        assert isinstance(decorator, Value)
+        assert isinstance(decorator, Value), decorator
         func_reg = builder.py_call(decorator, [func_reg], func_reg.line)
     return func_reg
 
@@ -589,8 +710,9 @@ def gen_glue(
     """
     if fdef.is_property:
         return gen_glue_property(builder, base_sig, target, cls, base, fdef.line, do_py_ops)
-    else:
-        return gen_glue_method(builder, base_sig, target, cls, base, fdef.line, do_py_ops)
+    if do_py_ops and target.name.startswith(PROPSET_PREFIX):
+        return gen_glue_property_setter(builder, base_sig, target, cls, base, fdef.line)
+    return gen_glue_method(builder, base_sig, target, cls, base, fdef.line, do_py_ops)
 
 
 class ArgInfo(NamedTuple):
@@ -675,6 +797,23 @@ def gen_glue_method(
         do_pycall = True
 
     if do_pycall:
+        if bitmap_args:
+            # Optional arguments whose type has no reserved error value are missing if their
+            # bit in the bitmap is unset. Box them and use NULL for missing arguments, since
+            # NULL optional arguments are omitted from the Python call.
+            index = 0
+            for i, arg in enumerate(rt_args[: len(args)]):
+                if arg.kind.is_optional() and arg.type.error_overlap:
+                    boxed = Register(object_rprimitive)
+                    builder.assign(boxed, args[i], line)
+                    builder.assign_if_bitmap_unset(
+                        boxed,
+                        lambda: builder.add(LoadErrorValue(object_rprimitive, undefines=True)),
+                        index,
+                        line,
+                    )
+                    args[i] = boxed
+                    index += 1
         if target.decl.kind == FUNC_STATICMETHOD:
             # FIXME: this won't work if we can do interpreted subclasses
             first = builder.builder.get_native_type(cls)
@@ -702,6 +841,7 @@ def gen_glue_method(
             builder.module_name,
             FuncSignature(rt_args, ret_type),
             target.decl.kind,
+            is_coroutine=target.decl.is_coroutine,
         ),
         arg_regs,
         blocks,
@@ -781,15 +921,66 @@ def gen_glue_property(
     )
 
 
+def gen_glue_property_setter(
+    builder: IRBuilder, sig: FuncSignature, target: FuncIR, cls: ClassIR, base: ClassIR, line: int
+) -> FuncIR:
+    """Generate a shadow glue method for a property setter.
+
+    For interpreted subclasses, property setters can't be called via the
+    internal __mypyc_setter__<name> method. Instead, use Python's setattr
+    to set the property via the standard descriptor protocol.
+    """
+    builder.enter()
+    builder.ret_types[-1] = sig.ret_type
+
+    rt_args = list(sig.args)
+    rt_args[0] = RuntimeArg(sig.args[0].name, RInstance(cls))
+
+    arg_info = get_args(builder, rt_args, line)
+    args = arg_info.args
+
+    self_arg = args[0]
+    value_arg = args[1]
+
+    # Extract the property name from "__mypyc_setter__<name>"
+    assert target.name.startswith(PROPSET_PREFIX)
+    prop_name = target.name[len(PROPSET_PREFIX) :]
+
+    builder.primitive_op(
+        py_setattr_op,
+        [
+            self_arg,
+            builder.load_str(prop_name),
+            builder.coerce(value_arg, object_rprimitive, line),
+        ],
+        line,
+    )
+    retval = builder.coerce(builder.none(), sig.ret_type, line)
+    builder.add(Return(retval))
+
+    arg_regs, _, blocks, return_type, _ = builder.leave()
+    return FuncIR(
+        FuncDecl(
+            target.name + "__" + base.name + "_glue",
+            cls.name,
+            builder.module_name,
+            FuncSignature(rt_args, return_type),
+        ),
+        arg_regs,
+        blocks,
+    )
+
+
 def get_func_target(builder: IRBuilder, fdef: FuncDef) -> AssignmentTarget:
     """Given a FuncDef, return the target for the instance of its callable class.
 
     If the function was not already defined somewhere, then define it
     and add it to the current environment.
     """
-    if fdef.original_def:
+    target_symbol = get_func_target_symbol(fdef)
+    if target_symbol is not fdef:
         # Get the target associated with the previously defined FuncDef.
-        return builder.lookup(fdef.original_def)
+        return builder.lookup(target_symbol)
 
     if builder.fn_info.is_generator or builder.fn_info.add_nested_funcs_to_env:
         return builder.lookup(fdef)
@@ -797,13 +988,29 @@ def get_func_target(builder: IRBuilder, fdef: FuncDef) -> AssignmentTarget:
     return builder.add_local_reg(fdef, object_rprimitive)
 
 
-def load_type(builder: IRBuilder, typ: TypeInfo, line: int) -> Value:
+def load_type(builder: IRBuilder, typ: TypeInfo, unbounded_type: Type | None, line: int) -> Value:
+    # typ.fullname contains the module where the class object was defined. However, it is possible
+    # that the class object's module was not imported in the file currently being compiled. So, we
+    # use unbounded_type.name (if provided by caller) to load the class object through one of the
+    # imported modules.
+    # Example: for `json.JSONDecoder`, typ.fullname is `json.decoder.JSONDecoder` but the Python
+    # file may import `json` not `json.decoder`.
+    # Another corner case: The Python file being compiled imports mod1 and has a type hint
+    # `mod1.OuterClass.InnerClass`. But, mod1/__init__.py might import OuterClass like this:
+    # `from mod2.mod3 import OuterClass`. In this case, typ.fullname is
+    # `mod2.mod3.OuterClass.InnerClass` and `unbounded_type.name` is `mod1.OuterClass.InnerClass`.
+    # So, we must use unbounded_type.name to load the class object.
+    # See issue mypyc/mypyc#1087.
     if typ in builder.mapper.type_to_ir:
         class_ir = builder.mapper.type_to_ir[typ]
         class_obj = builder.builder.get_native_type(class_ir)
-    elif typ.fullname in builtin_names:
-        builtin_addr_type, src = builtin_names[typ.fullname]
-        class_obj = builder.add(LoadAddress(builtin_addr_type, src, line))
+    elif builtin := builder.load_builtin(typ.fullname, line):
+        class_obj = builtin
+    elif isinstance(unbounded_type, UnboundType):
+        path_parts = unbounded_type.name.split(".")
+        class_obj = builder.load_global_str(path_parts[0], line)
+        for attr in path_parts[1:]:
+            class_obj = builder.py_get_attr(class_obj, attr, line)
     else:
         class_obj = builder.load_global_str(typ.name, line)
 
@@ -840,7 +1047,7 @@ def generate_singledispatch_dispatch_function(
         dispatch_func_obj, "dispatch_cache", dict_rprimitive, line
     )
     call_find_impl, use_cache, call_func = BasicBlock(), BasicBlock(), BasicBlock()
-    get_result = builder.call_c(dict_get_method_with_none, [dispatch_cache, arg_type], line)
+    get_result = builder.primitive_op(dict_get_method_with_none, [dispatch_cache, arg_type], line)
     is_not_none = builder.translate_is_op(get_result, builder.none_object(), "is not", line)
     impl_to_use = Register(object_rprimitive)
     builder.add_bool_branch(is_not_none, use_cache, call_find_impl)
@@ -853,7 +1060,7 @@ def generate_singledispatch_dispatch_function(
     find_impl = builder.load_module_attr_by_fullname("functools._find_impl", line)
     registry = load_singledispatch_registry(builder, dispatch_func_obj, line)
     uncached_impl = builder.py_call(find_impl, [arg_type, registry], line)
-    builder.call_c(dict_set_item_op, [dispatch_cache, arg_type, uncached_impl], line)
+    builder.call_c(exact_dict_set_item_op, [dispatch_cache, arg_type, uncached_impl], line)
     builder.assign(impl_to_use, uncached_impl, line)
     builder.goto(call_func)
 
@@ -874,8 +1081,8 @@ def gen_calls_to_correct_impl(
         coerced = builder.coerce(ret_val, current_func_decl.sig.ret_type, line)
         builder.add(Return(coerced))
 
-    typ, src = builtin_names["builtins.int"]
-    int_type_obj = builder.add(LoadAddress(typ, src, line))
+    int_type_obj = builder.load_builtin("builtins.int", line)
+    assert int_type_obj
     is_int = builder.builder.type_is_op(impl_to_use, int_type_obj, line)
 
     native_call, non_native_call = BasicBlock(), BasicBlock()
@@ -889,9 +1096,8 @@ def gen_calls_to_correct_impl(
         call_impl, next_impl = BasicBlock(), BasicBlock()
 
         current_id = builder.load_int(i)
-        builder.builder.compare_tagged_condition(
-            passed_id, current_id, "==", call_impl, next_impl, line
-        )
+        cond = builder.binary_op(passed_id, current_id, "==", line)
+        builder.add_bool_branch(cond, call_impl, next_impl)
 
         # Call the registered implementation
         builder.activate_block(call_impl)
@@ -959,7 +1165,7 @@ def generate_dispatch_glue_native_function(
 
 def generate_singledispatch_callable_class_ctor(builder: IRBuilder) -> None:
     """Create an __init__ that sets registry and dispatch_cache to empty dicts"""
-    line = -1
+    line = builder.fn_info.fitem.line
     class_ir = builder.fn_info.callable_class.ir
     with builder.enter_method(class_ir, "__init__", bool_rprimitive):
         empty_dict = builder.call_c(dict_new_op, [], line)
@@ -967,13 +1173,13 @@ def generate_singledispatch_callable_class_ctor(builder: IRBuilder) -> None:
         cache_dict = builder.call_c(dict_new_op, [], line)
         dispatch_cache_str = builder.load_str("dispatch_cache")
         # use the py_setattr_op instead of SetAttr so that it also gets added to our __dict__
-        builder.call_c(py_setattr_op, [builder.self(), dispatch_cache_str, cache_dict], line)
+        builder.primitive_op(py_setattr_op, [builder.self(), dispatch_cache_str, cache_dict], line)
         # the generated C code seems to expect that __init__ returns a char, so just return 1
         builder.add(Return(Integer(1, bool_rprimitive, line), line))
 
 
 def add_register_method_to_callable_class(builder: IRBuilder, fn_info: FuncInfo) -> None:
-    line = -1
+    line = fn_info.fitem.line
     with builder.enter_method(fn_info.callable_class.ir, "register", object_rprimitive):
         cls_arg = builder.add_argument("cls", object_rprimitive)
         func_arg = builder.add_argument("func", object_rprimitive, ArgKind.ARG_OPT)
@@ -987,10 +1193,6 @@ def load_singledispatch_registry(builder: IRBuilder, dispatch_func_obj: Value, l
 
 def singledispatch_main_func_name(orig_name: str) -> str:
     return f"__mypyc_singledispatch_main_function_{orig_name}__"
-
-
-def get_registry_identifier(fitem: FuncDef) -> str:
-    return f"__mypyc_singledispatch_registry_{fitem.fullname}__"
 
 
 def maybe_insert_into_registry_dict(builder: IRBuilder, fitem: FuncDef) -> None:
@@ -1014,7 +1216,7 @@ def maybe_insert_into_registry_dict(builder: IRBuilder, fitem: FuncDef) -> None:
         registry_dict = builder.builder.make_dict([(loaded_object_type, main_func_obj)], line)
 
         dispatch_func_obj = builder.load_global_str(fitem.name, line)
-        builder.call_c(
+        builder.primitive_op(
             py_setattr_op, [dispatch_func_obj, builder.load_str("registry"), registry_dict], line
         )
 
@@ -1034,8 +1236,8 @@ def maybe_insert_into_registry_dict(builder: IRBuilder, fitem: FuncDef) -> None:
         )
         registry = load_singledispatch_registry(builder, dispatch_func_obj, line)
         for typ in types:
-            loaded_type = load_type(builder, typ, line)
-            builder.call_c(dict_set_item_op, [registry, loaded_type, to_insert], line)
+            loaded_type = load_type(builder, typ, None, line)
+            builder.call_c(exact_dict_set_item_op, [registry, loaded_type, to_insert], line)
         dispatch_cache = builder.builder.get_attr(
             dispatch_func_obj, "dispatch_cache", dict_rprimitive, line
         )
@@ -1060,9 +1262,10 @@ def gen_property_getter_ir(
     name = func_decl.name
     builder.enter(name)
     self_reg = builder.add_argument("self", func_decl.sig.args[0].type)
+    line = func_decl._line or -1
     if not is_trait:
-        value = builder.builder.get_attr(self_reg, name, func_decl.sig.ret_type, -1)
-        builder.add(Return(value))
+        value = builder.builder.get_attr(self_reg, name, func_decl.sig.ret_type, line)
+        builder.add(Return(value, line))
     else:
         builder.add(Unreachable())
     args, _, blocks, ret_type, fn_info = builder.leave()
@@ -1082,8 +1285,9 @@ def gen_property_setter_ir(
     value_reg = builder.add_argument("value", func_decl.sig.args[1].type)
     assert name.startswith(PROPSET_PREFIX)
     attr_name = name[len(PROPSET_PREFIX) :]
+    line = func_decl._line or -1
     if not is_trait:
-        builder.add(SetAttr(self_reg, attr_name, value_reg, -1))
-    builder.add(Return(builder.none()))
+        builder.add(SetAttr(self_reg, attr_name, value_reg, line))
+    builder.add(Return(builder.none(), line))
     args, _, blocks, ret_type, fn_info = builder.leave()
-    return FuncIR(func_decl, args, blocks)
+    return FuncIR(func_decl, args, blocks, line)

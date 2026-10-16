@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, Iterable, List, Sequence
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Final, TypeGuard, cast
 
 import mypy.subtypes
 import mypy.typeops
 from mypy.argmap import ArgTypeExpander
 from mypy.erasetype import erase_typevars
+from mypy.expandtype import expand_type_by_instance
 from mypy.maptype import map_instance_to_supertype
 from mypy.nodes import (
     ARG_OPT,
@@ -20,6 +22,7 @@ from mypy.nodes import (
     TypeInfo,
 )
 from mypy.types import (
+    MAX_PROTOCOL_DEPTH,
     TUPLE_LIKE_INSTANCE_NAMES,
     AnyType,
     CallableType,
@@ -39,7 +42,6 @@ from mypy.types import (
     TypeAliasType,
     TypedDictType,
     TypeOfAny,
-    TypeQuery,
     TypeType,
     TypeVarId,
     TypeVarLikeType,
@@ -51,6 +53,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     find_unpack_in_list,
+    flatten_nested_tuples,
     get_proper_type,
     has_recursive_types,
     has_type_vars,
@@ -122,15 +125,15 @@ def infer_constraints_for_callable(
     param_spec = callee.param_spec()
     param_spec_arg_types = []
     param_spec_arg_names = []
-    param_spec_arg_kinds = []
+    param_spec_arg_kinds: list[ArgKind] = []
 
     incomplete_star_mapping = False
-    for i, actuals in enumerate(formal_to_actual):
+    for i, actuals in enumerate(formal_to_actual):  # TODO: isn't this `enumerate(arg_types)`?
         for actual in actuals:
-            if actual is None and callee.arg_kinds[i] in (ARG_STAR, ARG_STAR2):
+            if actual is None and callee.arg_kinds[i] in (ARG_STAR, ARG_STAR2):  # type: ignore[unreachable]
                 # We can't use arguments to infer ParamSpec constraint, if only some
                 # are present in the current inference pass.
-                incomplete_star_mapping = True
+                incomplete_star_mapping = True  # type: ignore[unreachable]
                 break
 
     for i, actuals in enumerate(formal_to_actual):
@@ -223,9 +226,6 @@ def infer_constraints_for_callable(
                 if actual_arg_type is None:
                     continue
 
-                actual_type = mapper.expand_actual_type(
-                    actual_arg_type, arg_kinds[actual], callee.arg_names[i], callee.arg_kinds[i]
-                )
                 if param_spec and callee.arg_kinds[i] in (ARG_STAR, ARG_STAR2):
                     # If actual arguments are mapped to ParamSpec type, we can't infer individual
                     # constraints, instead store them and infer single constraint at the end.
@@ -243,6 +243,12 @@ def infer_constraints_for_callable(
                         )
                         param_spec_arg_names.append(arg_names[actual] if arg_names else None)
                 else:
+                    actual_type = mapper.expand_actual_type(
+                        actual_arg_type,
+                        arg_kinds[actual],
+                        callee.arg_names[i],
+                        callee.arg_kinds[i],
+                    )
                     c = infer_constraints(callee.arg_types[i], actual_type, SUPERTYPE_OF)
                     constraints.extend(c)
     if (
@@ -271,7 +277,11 @@ def infer_constraints_for_callable(
 
 
 def infer_constraints(
-    template: Type, actual: Type, direction: int, skip_neg_op: bool = False
+    template: Type,
+    actual: Type,
+    direction: int,
+    skip_neg_op: bool = False,
+    erase_types: bool = True,
 ) -> list[Constraint]:
     """Infer type constraints.
 
@@ -308,14 +318,14 @@ def infer_constraints(
             # Return early on an empty branch.
             return []
         type_state.inferring.append((template, actual))
-        res = _infer_constraints(template, actual, direction, skip_neg_op)
+        res = _infer_constraints(template, actual, direction, skip_neg_op, erase_types)
         type_state.inferring.pop()
         return res
-    return _infer_constraints(template, actual, direction, skip_neg_op)
+    return _infer_constraints(template, actual, direction, skip_neg_op, erase_types)
 
 
 def _infer_constraints(
-    template: Type, actual: Type, direction: int, skip_neg_op: bool
+    template: Type, actual: Type, direction: int, skip_neg_op: bool, erase_types: bool
 ) -> list[Constraint]:
     orig_template = template
     template = get_proper_type(template)
@@ -324,9 +334,9 @@ def _infer_constraints(
     # Type inference shouldn't be affected by whether union types have been simplified.
     # We however keep any ErasedType items, so that the caller will see it when using
     # checkexpr.has_erased_component().
-    if isinstance(template, UnionType):
+    if not type_state.keep_unions and isinstance(template, UnionType):
         template = mypy.typeops.make_simplified_union(template.items, keep_erased=True)
-    if isinstance(actual, UnionType):
+    if not type_state.keep_unions and isinstance(actual, UnionType):
         actual = mypy.typeops.make_simplified_union(actual.items, keep_erased=True)
 
     # Ignore Any types from the type suggestion engine to avoid them
@@ -335,6 +345,16 @@ def _infer_constraints(
     # doesn't really matter because it is all heuristic anyway.)
     if isinstance(actual, AnyType) and actual.type_of_any == TypeOfAny.suggestion_engine:
         return []
+
+    # type[A | B] is always represented as type[A] | type[B] internally.
+    # This makes our constraint solver choke on type[T] <: type[A] | type[B],
+    # solving T as generic meet(A, B) which is often `object`. Force unwrap such unions
+    # if both sides are type[...] or unions thereof. See `testTypeVarType` test
+    type_type_unwrapped = False
+    if _is_type_type(template) and _is_type_type(actual):
+        type_type_unwrapped = True
+        template = _unwrap_type_type(template)
+        actual = _unwrap_type_type(actual)
 
     # If the template is simply a type variable, emit a Constraint directly.
     # We need to handle this case before handling Unions for two reasons:
@@ -367,9 +387,31 @@ def _infer_constraints(
             res.extend(infer_constraints(t_item, actual, direction))
         return res
     if direction == SUPERTYPE_OF and isinstance(actual, UnionType):
+        # Case when *both* template and actual are unions needs special-casing:
+        # * First, remove identical items that appear in both unions.
+        # * Then, restore any unions that where split in the loop below
+        #   (see comment above about plain type variables for why this is important).
+        # See e.g. testOptionalUnionInferencePrecise for situations where this helps.
+        nested_type_vars = None
+        if isinstance(template, UnionType):
+            nested_type_vars = [it for it in template.items if isinstance(it, TypeVarType)]
+            template, actual = remove_common_items(template, actual)
+            if not isinstance(actual, UnionType):
+                if isinstance(actual, UninhabitedType):
+                    # Empty after simplification: do not infer spurious constraints.
+                    return []
+                # Not a union after simplification, restart from the top.
+                return infer_constraints(template, actual, direction)
         res = []
         for a_item in actual.items:
+            # `orig_template` has to be preserved intact in case it's recursive.
+            # If we unwrapped ``type[...]`` previously, wrap the item back again,
+            # as ``type[...]`` can't be removed from `orig_template`.
+            if type_type_unwrapped:
+                a_item = TypeType.make_normalized(a_item)
             res.extend(infer_constraints(orig_template, a_item, direction))
+        if nested_type_vars:
+            res = restore_union(res, actual, nested_type_vars)
         return res
 
     # Now the potential subtype is known not to be a Union or a type
@@ -377,13 +419,14 @@ def _infer_constraints(
     # be a supertype of the potential subtype, some item of the Union
     # must be a supertype of it.
     if direction == SUBTYPE_OF and isinstance(actual, UnionType):
-        # If some of items is not a complete type, disregard that.
-        items = simplify_away_incomplete_types(actual.items)
         # We infer constraints eagerly -- try to find constraints for a type
         # variable if possible. This seems to help with some real-world
         # use cases.
         return any_constraints(
-            [infer_constraints_if_possible(template, a_item, direction) for a_item in items],
+            [
+                infer_constraints_if_possible(template, a_item, direction)
+                for a_item in actual.items
+            ],
             eager=True,
         )
     if direction == SUPERTYPE_OF and isinstance(template, UnionType):
@@ -395,7 +438,7 @@ def _infer_constraints(
                 infer_constraints_if_possible(t_item, actual, direction)
                 for t_item in template.items
             ],
-            eager=False,
+            eager=isinstance(actual, AnyType),
         )
         if result:
             return result
@@ -404,7 +447,27 @@ def _infer_constraints(
         return []
 
     # Remaining cases are handled by ConstraintBuilderVisitor.
-    return template.accept(ConstraintBuilderVisitor(actual, direction, skip_neg_op))
+    return template.accept(ConstraintBuilderVisitor(actual, direction, skip_neg_op, erase_types))
+
+
+def _is_type_type(tp: ProperType) -> TypeGuard[TypeType | UnionType]:
+    """Is ``tp`` a ``type[...]`` or a union thereof?
+
+    ``Type[A | B]`` is internally represented as ``type[A] | type[B]``, and this
+    troubles the solver sometimes.
+    """
+    return (
+        isinstance(tp, TypeType)
+        or isinstance(tp, UnionType)
+        and all(isinstance(get_proper_type(o), TypeType) for o in tp.items)
+    )
+
+
+def _unwrap_type_type(tp: TypeType | UnionType) -> ProperType:
+    """Extract the inner type from ``type[...]`` expression or a union thereof."""
+    if isinstance(tp, TypeType):
+        return tp.item
+    return UnionType.make_union([cast(TypeType, get_proper_type(o)).item for o in tp.items])
 
 
 def infer_constraints_if_possible(
@@ -471,7 +534,7 @@ def handle_recursive_union(template: UnionType, actual: Type, direction: int) ->
     ) or infer_constraints(UnionType.make_union(type_var_items), actual, direction)
 
 
-def any_constraints(options: list[list[Constraint] | None], eager: bool) -> list[Constraint]:
+def any_constraints(options: list[list[Constraint] | None], *, eager: bool) -> list[Constraint]:
     """Deduce what we can from a collection of constraint lists.
 
     It's a given that at least one of the lists must be satisfied. A
@@ -494,27 +557,33 @@ def any_constraints(options: list[list[Constraint] | None], eager: bool) -> list
         # Multiple sets of constraints that are all the same. Just pick any one of them.
         return valid_options[0]
 
-    if all(is_similar_constraints(valid_options[0], c) for c in valid_options[1:]):
+    # This special-casing is not safe for ParamSpecs and TypeVarTuples, since unions are
+    # not valid constraints for them. This is however only needed in niche edge cases.
+    if all(is_similar_constraints(valid_options[0], c) for c in valid_options[1:]) and all(
+        isinstance(c.origin_type_var, TypeVarType) for c in valid_options[0]
+    ):
         # All options have same structure. In this case we can merge-in trivial
         # options (i.e. those that only have Any) and try again.
-        # TODO: More generally, if a given (variable, direction) pair appears in
-        # every option, combine the bounds with meet/join always, not just for Any.
         trivial_options = select_trivial(valid_options)
         if trivial_options and len(trivial_options) < len(valid_options):
             merged_options = []
             for option in valid_options:
                 if option in trivial_options:
                     continue
-                if option is not None:
-                    merged_option: list[Constraint] | None = [merge_with_any(c) for c in option]
-                else:
-                    merged_option = None
-                merged_options.append(merged_option)
-            return any_constraints(list(merged_options), eager)
+                merged_options.append([merge_with_any(c) for c in option])
+            return any_constraints(list(merged_options), eager=eager)
 
     # If normal logic didn't work, try excluding trivially unsatisfiable constraint (due to
     # upper bounds) from each option, and comparing them again.
     filtered_options = [filter_satisfiable(o) for o in options]
+    if filtered_options != options:
+        return any_constraints(filtered_options, eager=eager)
+
+    # Try harder: if that didn't work, try to strip typevars that aren't meta vars.
+    # Note this is what we would always do, but unfortunately some callers may not
+    # set the meta var status correctly (for historical reasons), so we use this as
+    # a fallback only.
+    filtered_options = [exclude_non_meta_vars(o) for o in options]
     if filtered_options != options:
         return any_constraints(filtered_options, eager=eager)
 
@@ -532,6 +601,7 @@ def filter_satisfiable(option: list[Constraint] | None) -> list[Constraint] | No
     """
     if not option:
         return option
+
     satisfiable = []
     for c in option:
         if isinstance(c.origin_type_var, TypeVarType) and c.origin_type_var.values:
@@ -544,6 +614,15 @@ def filter_satisfiable(option: list[Constraint] | None) -> list[Constraint] | No
     if not satisfiable:
         return None
     return satisfiable
+
+
+def exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] | None:
+    # If we had an empty list, keep it intact
+    if not option:
+        return option
+    # However, if none of the options actually references meta vars, better remove
+    # this constraint entirely.
+    return [c for c in option if c.type_var.is_meta_var()] or None
 
 
 def is_same_constraints(x: list[Constraint], y: list[Constraint]) -> bool:
@@ -598,39 +677,16 @@ def _is_similar_constraints(x: list[Constraint], y: list[Constraint]) -> bool:
     return True
 
 
-def simplify_away_incomplete_types(types: Iterable[Type]) -> list[Type]:
-    complete = [typ for typ in types if is_complete_type(typ)]
-    if complete:
-        return complete
-    else:
-        return list(types)
-
-
-def is_complete_type(typ: Type) -> bool:
-    """Is a type complete?
-
-    A complete doesn't have uninhabited type components or (when not in strict
-    optional mode) None components.
-    """
-    return typ.accept(CompleteTypeVisitor())
-
-
-class CompleteTypeVisitor(TypeQuery[bool]):
-    def __init__(self) -> None:
-        super().__init__(all)
-
-    def visit_uninhabited_type(self, t: UninhabitedType) -> bool:
-        return False
-
-
-class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
+class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
     """Visitor class for inferring type constraints."""
 
     # The type that is compared against a template
     # TODO: The value may be None. Is that actually correct?
     actual: ProperType
 
-    def __init__(self, actual: ProperType, direction: int, skip_neg_op: bool) -> None:
+    def __init__(
+        self, actual: ProperType, direction: int, skip_neg_op: bool, erase_types: bool
+    ) -> None:
         # Direction must be SUBTYPE_OF or SUPERTYPE_OF.
         self.actual = actual
         self.direction = direction
@@ -638,6 +694,10 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         # this is used to prevent infinite recursion when both template and actual are
         # generic callables.
         self.skip_neg_op = skip_neg_op
+        # Normally we should erase generic actual type when inferring against type[T]
+        # to avoid leaking type variables, see testGenericClassAsArgumentToType.
+        # The only exception is self-types in generic classes, where we set this to False.
+        self.erase_types = erase_types
 
     # Trivial leaf types
 
@@ -688,14 +748,19 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
 
     def visit_parameters(self, template: Parameters) -> list[Constraint]:
         # Constraining Any against C[P] turns into infer_against_any([P], Any)
-        # ... which seems like the only case this can happen. Better to fail loudly otherwise.
         if isinstance(self.actual, AnyType):
             return self.infer_against_any(template.arg_types, self.actual)
         if type_state.infer_polymorphic and isinstance(self.actual, Parameters):
             # For polymorphic inference we need to be able to infer secondary constraints
             # in situations like [x: T] <: P <: [x: int].
             return infer_callable_arguments_constraints(template, self.actual, self.direction)
-        raise RuntimeError("Parameters cannot be constrained to")
+        if type_state.infer_polymorphic and isinstance(self.actual, ParamSpecType):
+            # Similar for [x: T] <: Q <: Concatenate[int, P].
+            return infer_callable_arguments_constraints(
+                template, self.actual.prefix, self.direction
+            )
+        # There also may be unpatched types after a user error, simply ignore them.
+        return []
 
     # Non-leaf types
 
@@ -705,46 +770,46 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         if isinstance(actual, (CallableType, Overloaded)) and template.type.is_protocol:
             if "__call__" in template.type.protocol_members:
                 # Special case: a generic callback protocol
-                if not any(template == t for t in template.type.inferring):
+                if len(template.type.inferring) < MAX_PROTOCOL_DEPTH and not any(
+                    template == t for t in template.type.inferring
+                ):
                     template.type.inferring.append(template)
                     call = mypy.subtypes.find_member(
                         "__call__", template, actual, is_operator=True
                     )
                     assert call is not None
-                    if mypy.subtypes.is_subtype(actual, erase_typevars(call)):
-                        subres = infer_constraints(call, actual, self.direction)
-                        res.extend(subres)
+                    if (
+                        self.direction == SUPERTYPE_OF
+                        and mypy.subtypes.is_subtype(actual, erase_typevars(call))
+                        or self.direction == SUBTYPE_OF
+                        and mypy.subtypes.is_subtype(erase_typevars(call), actual)
+                    ):
+                        res.extend(infer_constraints(call, actual, self.direction))
                     template.type.inferring.pop()
         if isinstance(actual, CallableType) and actual.fallback is not None:
-            if actual.is_type_obj() and template.type.is_protocol:
-                ret_type = get_proper_type(actual.ret_type)
-                if isinstance(ret_type, TupleType):
-                    ret_type = mypy.typeops.tuple_fallback(ret_type)
-                if isinstance(ret_type, Instance):
-                    if self.direction == SUBTYPE_OF:
-                        subtype = template
-                    else:
-                        subtype = ret_type
+            if (
+                actual.is_type_obj()
+                and template.type.is_protocol
+                and self.direction == SUPERTYPE_OF
+            ):
+                instance_type = actual.get_instance_type(force_fallback=True)
+                if isinstance(instance_type, Instance):
                     res.extend(
                         self.infer_constraints_from_protocol_members(
-                            ret_type, template, subtype, template, class_obj=True
+                            instance_type, template, instance_type, template, class_obj=True
                         )
                     )
             actual = actual.fallback
         if isinstance(actual, TypeType) and template.type.is_protocol:
-            if isinstance(actual.item, Instance):
-                if self.direction == SUBTYPE_OF:
-                    subtype = template
-                else:
-                    subtype = actual.item
-                res.extend(
-                    self.infer_constraints_from_protocol_members(
-                        actual.item, template, subtype, template, class_obj=True
-                    )
-                )
             if self.direction == SUPERTYPE_OF:
-                # Infer constraints for Type[T] via metaclass of T when it makes sense.
                 a_item = actual.item
+                if isinstance(a_item, Instance):
+                    res.extend(
+                        self.infer_constraints_from_protocol_members(
+                            a_item, template, a_item, template, class_obj=True
+                        )
+                    )
+                # Infer constraints for Type[T] via metaclass of T when it makes sense.
                 if isinstance(a_item, TypeVarType):
                     a_item = get_proper_type(a_item.upper_bound)
                 if isinstance(a_item, Instance) and a_item.type.metaclass_type:
@@ -757,13 +822,13 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         if isinstance(actual, Overloaded) and actual.fallback is not None:
             actual = actual.fallback
         if isinstance(actual, TypedDictType):
-            actual = actual.as_anonymous().fallback
+            actual = actual.create_anonymous_fallback()
         if isinstance(actual, LiteralType):
             actual = actual.fallback
         if isinstance(actual, Instance):
             instance = actual
             erased = erase_typevars(template)
-            assert isinstance(erased, Instance)  # type: ignore[misc]
+            assert isinstance(erased, ProperType) and isinstance(erased, Instance)
             # We always try nominal inference if possible,
             # it is much faster than the structural one.
             if self.direction == SUBTYPE_OF and template.type.has_base(instance.type.fullname):
@@ -901,6 +966,7 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
             if (
                 template.type.is_protocol
                 and self.direction == SUPERTYPE_OF
+                and len(template.type.inferring) < MAX_PROTOCOL_DEPTH
                 and
                 # We avoid infinite recursion for structural subtypes by checking
                 # whether this type already appeared in the inference chain.
@@ -924,6 +990,7 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
             elif (
                 instance.type.is_protocol
                 and self.direction == SUBTYPE_OF
+                and len(instance.type.inferring) < MAX_PROTOCOL_DEPTH
                 and
                 # We avoid infinite recursion for structural subtypes also here.
                 not any(instance == i for i in reversed(instance.type.inferring))
@@ -962,7 +1029,25 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                 res.extend(cb)
             return res
         elif isinstance(actual, TupleType) and self.direction == SUPERTYPE_OF:
-            return infer_constraints(template, mypy.typeops.tuple_fallback(actual), self.direction)
+            instance = mypy.typeops.tuple_fallback(actual)
+            erased = erase_typevars(template)
+            assert isinstance(erased, ProperType) and isinstance(erased, Instance)
+            # Special-case protocols before using fallback to get more precise constraints
+            # for custom tuple types like NamedTuples.
+            if (
+                template.type.is_protocol
+                and self.direction == SUPERTYPE_OF
+                and len(template.type.inferring) < MAX_PROTOCOL_DEPTH
+                and not any(template == t for t in reversed(template.type.inferring))
+                and mypy.subtypes.is_protocol_implementation(instance, erased, skip=["__call__"])
+            ):
+                template.type.inferring.append(template)
+                res = self.infer_constraints_from_protocol_members(
+                    instance, template, original_actual, template
+                )
+                template.type.inferring.pop()
+                return res
+            return infer_constraints(template, instance, self.direction)
         elif isinstance(actual, TypeVarType):
             if not actual.values and not actual.id.is_meta_var():
                 return infer_constraints(template, actual.upper_bound, self.direction)
@@ -998,6 +1083,17 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                 return []  # See #11020
             # The above is safe since at this point we know that 'instance' is a subtype
             # of (erased) 'template', therefore it defines all protocol members
+            if class_obj:
+                # For class objects we must only infer constraints if possible, otherwise it
+                # can lead to confusion between class and instance, for example StrEnum is
+                # Iterable[str] for an instance, but Iterable[StrEnum] for a class object.
+                if not mypy.subtypes.is_subtype(
+                    inst, erase_typevars(temp), ignore_pos_arg_names=True
+                ):
+                    continue
+            # This exception matches the one in typeops.py, see PR #14121 for context.
+            if member == "__call__" and instance.type.is_metaclass(precise=True):
+                continue
             res.extend(infer_constraints(temp, inst, self.direction))
             if mypy.subtypes.IS_SETTABLE in mypy.subtypes.get_member_flags(member, protocol):
                 # Settable members are invariant, add opposite constraints
@@ -1010,18 +1106,22 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         # using e.g. callback protocols.
         # TODO: check that callables match? Ideally we should not infer constraints
         # callables that can never be subtypes of one another in given direction.
-        template = template.with_unpacked_kwargs()
+        template = template.with_unpacked_kwargs().with_normalized_var_args()
         extra_tvars = False
         if isinstance(self.actual, CallableType):
             res: list[Constraint] = []
-            cactual = self.actual.with_unpacked_kwargs()
+            cactual = self.actual.with_unpacked_kwargs().with_normalized_var_args()
             param_spec = template.param_spec()
 
             template_ret_type, cactual_ret_type = template.ret_type, cactual.ret_type
-            if template.type_guard is not None:
+            if template.type_guard is not None and cactual.type_guard is not None:
                 template_ret_type = template.type_guard
-            if cactual.type_guard is not None:
                 cactual_ret_type = cactual.type_guard
+
+            if template.type_is is not None and cactual.type_is is not None:
+                template_ret_type = template.type_is
+                cactual_ret_type = cactual.type_is
+
             res.extend(infer_constraints(template_ret_type, cactual_ret_type, self.direction))
 
             if param_spec is None:
@@ -1035,7 +1135,10 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                     # like U -> U, should be Callable[..., Any], but if U is a self-type, we can
                     # allow it to leak, to be later bound to self. A bunch of existing code
                     # depends on this old behaviour.
-                    and not any(tv.id.raw_id == 0 for tv in cactual.variables)
+                    and not (
+                        any(tv.id.is_self() for tv in cactual.variables)
+                        and template.is_ellipsis_args
+                    )
                 ):
                     # If the actual callable is generic, infer constraints in the opposite
                     # direction, and indicate to the solver there are extra type variables
@@ -1051,7 +1154,11 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                 # (with literal '...').
                 if not template.is_ellipsis_args:
                     unpack_present = find_unpack_in_list(template.arg_types)
-                    if unpack_present is not None:
+                    # When both ParamSpec and TypeVarTuple are present, things become messy
+                    # quickly. For now, we only allow ParamSpec to "capture" TypeVarTuple,
+                    # but not vice versa.
+                    # TODO: infer more from prefixes when possible.
+                    if unpack_present is not None and not cactual.param_spec():
                         # We need to re-normalize args to the form they appear in tuples,
                         # for callables we always pack the suffix inside another tuple.
                         unpack = template.arg_types[unpack_present]
@@ -1140,6 +1247,20 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         elif isinstance(self.actual, Overloaded):
             return self.infer_against_overloaded(self.actual, template)
         elif isinstance(self.actual, TypeType):
+            # This matches the corresponding logic in subtypes.py.
+            item = self.actual.item
+            if isinstance(item, TupleType):
+                item = mypy.typeops.tuple_fallback(item)
+            if isinstance(item, Instance):
+                constructor = mypy.typeops.type_object_type(item.type)
+                constructor = expand_type_by_instance(constructor, item)
+                # Only consider return type to match historic behavior (see below).
+                if isinstance(constructor, CallableType):
+                    return infer_constraints(
+                        template.ret_type, constructor.ret_type, self.direction
+                    )
+                elif isinstance(constructor, Overloaded):
+                    return self.infer_against_overloaded(constructor, template, ret_only=True)
             return infer_constraints(template.ret_type, self.actual.item, self.direction)
         elif isinstance(self.actual, Instance):
             # Instances with __call__ method defined are considered structural
@@ -1155,7 +1276,7 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
             return []
 
     def infer_against_overloaded(
-        self, overloaded: Overloaded, template: CallableType
+        self, overloaded: Overloaded, template: CallableType, ret_only: bool = False
     ) -> list[Constraint]:
         # Create constraints by matching an overloaded type against a template.
         # This is tricky to do in general. We cheat by only matching against
@@ -1163,13 +1284,16 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
         # seems to work somewhat well, but we should really use a more
         # reliable technique.
         item = find_matching_overload_item(overloaded, template)
+        if ret_only:
+            return infer_constraints(template.ret_type, item.ret_type, self.direction)
         return infer_constraints(template, item, self.direction)
 
     def visit_tuple_type(self, template: TupleType) -> list[Constraint]:
         actual = self.actual
         unpack_index = find_unpack_in_list(template.items)
-        is_varlength_tuple = (
-            isinstance(actual, Instance) and actual.type.fullname == "builtins.tuple"
+        # TODO: we may need to be careful with direction to avoid spurious constraints.
+        is_varlength_tuple = isinstance(actual, Instance) and actual.type.has_base(
+            "builtins.tuple"
         )
 
         if isinstance(actual, TupleType) or is_varlength_tuple:
@@ -1181,23 +1305,26 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                     unpack_type = template.items[unpack_index]
                     assert isinstance(unpack_type, UnpackType)
                     unpacked_type = get_proper_type(unpack_type.type)
+                    assert isinstance(actual, Instance)  # ensured by is_varlength_tuple == True
+                    mapped = map_instance_to_supertype(
+                        actual, actual.type.get_base("builtins.tuple")
+                    )
                     if isinstance(unpacked_type, TypeVarTupleType):
                         res = [
-                            Constraint(type_var=unpacked_type, op=self.direction, target=actual)
+                            Constraint(type_var=unpacked_type, op=self.direction, target=mapped)
                         ]
                     else:
                         assert (
                             isinstance(unpacked_type, Instance)
                             and unpacked_type.type.fullname == "builtins.tuple"
                         )
-                        res = infer_constraints(unpacked_type, actual, self.direction)
-                    assert isinstance(actual, Instance)  # ensured by is_varlength_tuple == True
+                        res = infer_constraints(unpacked_type, mapped, self.direction)
                     for i, ti in enumerate(template.items):
                         if i == unpack_index:
                             # This one we just handled above.
                             continue
                         # For Tuple[T, *Ts, S] <: tuple[X, ...] infer also T <: X and S <: X.
-                        res.extend(infer_constraints(ti, actual.args[0], self.direction))
+                        res.extend(infer_constraints(ti, mapped.args[0], self.direction))
                     return res
                 else:
                     assert isinstance(actual, TupleType)
@@ -1216,7 +1343,7 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                     a_unpack = actual.items[a_unpack_index]
                     assert isinstance(a_unpack, UnpackType)
                     a_unpacked = get_proper_type(a_unpack.type)
-                    if len(actual.items) + 1 <= len(template.items):
+                    if len(actual.items) <= len(template.items) + 1:
                         a_prefix_len = a_unpack_index
                         a_suffix_len = len(actual.items) - a_unpack_index - 1
                         t_prefix, t_middle, t_suffix = split_with_prefix_and_suffix(
@@ -1256,6 +1383,11 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
                     res.extend(
                         infer_constraints(template_items[i], actual_items[i], self.direction)
                     )
+            res.extend(
+                infer_constraints(
+                    template.partial_fallback, actual.partial_fallback, self.direction
+                )
+            )
             return res
         elif isinstance(actual, AnyType):
             return self.infer_against_any(template.items, actual)
@@ -1287,10 +1419,18 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
 
     def infer_against_any(self, types: Iterable[Type], any_type: AnyType) -> list[Constraint]:
         res: list[Constraint] = []
-        for t in types:
+        # Some items may be things like `*Tuple[*Ts, T]` for example from callable types with
+        # suffix after *arg, so flatten them.
+        for t in flatten_nested_tuples(types):
             if isinstance(t, UnpackType):
                 if isinstance(t.type, TypeVarTupleType):
-                    res.append(Constraint(t.type, self.direction, any_type))
+                    res.append(
+                        Constraint(
+                            t.type,
+                            self.direction,
+                            t.type.tuple_fallback.copy_modified(args=[any_type]),
+                        )
+                    )
                 else:
                     unpacked = get_proper_type(t.type)
                     assert isinstance(unpacked, Instance)
@@ -1314,8 +1454,18 @@ class ConstraintBuilderVisitor(TypeVisitor[List[Constraint]]):
 
     def visit_type_type(self, template: TypeType) -> list[Constraint]:
         if isinstance(self.actual, CallableType):
+            if self.actual.is_type_obj():
+                instance_type = self.actual.get_instance_type()
+                if self.erase_types:
+                    instance_type = erase_typevars(instance_type)
+                return infer_constraints(template.item, instance_type, self.direction)
             return infer_constraints(template.item, self.actual.ret_type, self.direction)
         elif isinstance(self.actual, Overloaded):
+            if self.actual.is_type_obj():
+                instance_type = self.actual.items[0].get_instance_type()
+                if self.erase_types:
+                    instance_type = erase_typevars(instance_type)
+                return infer_constraints(template.item, instance_type, self.direction)
             return infer_constraints(template.item, self.actual.items[0].ret_type, self.direction)
         elif isinstance(self.actual, TypeType):
             return infer_constraints(template.item, self.actual.item, self.direction)
@@ -1377,6 +1527,37 @@ def find_matching_overload_items(
         # it maintains backward compatibility.
         res = items.copy()
     return res
+
+
+def remove_common_items(s: UnionType, t: UnionType) -> tuple[ProperType, ProperType]:
+    """Remove all items that appear in both unions."""
+    common = set(s.items) & set(t.items)
+    new_s = UnionType.make_union([it for it in s.items if it not in common])
+    new_t = UnionType.make_union([it for it in t.items if it not in common])
+    return get_proper_type(new_s), get_proper_type(new_t)
+
+
+def restore_union(
+    constraints: list[Constraint], union: UnionType, type_vars: list[TypeVarType]
+) -> list[Constraint]:
+    """Merge constrains against each item of a union to a single constraint against the union.
+
+    For each type variable we check whether all constraints for this type variable match
+    T :> Item for every item in the union, then replace such constraint group with a single
+    constraint. This will avoid accidentally inferring join from union.
+    """
+    union_set = {get_proper_type(it) for it in union.items}
+    to_restore = set()
+    for tv in type_vars:
+        relevant_cs = [c for c in constraints if c.origin_type_var == tv]
+        if not all(c.op == SUPERTYPE_OF for c in relevant_cs):
+            continue
+        if union_set == {get_proper_type(c.target) for c in relevant_cs}:
+            to_restore.add(tv)
+
+    original = [c for c in constraints if c.origin_type_var not in to_restore]
+    restored = [Constraint(tv, SUPERTYPE_OF, union) for tv in to_restore]
+    return original + restored
 
 
 def get_tuple_fallback_from_unpack(unpack: UnpackType) -> TypeInfo:
@@ -1472,6 +1653,17 @@ def build_constraints_for_simple_unpack(
             # This is the only case where we can guarantee there will be no partial overlap
             # (note however partial overlap is OK for variadic tuples, it is handled below).
             t_unpack = template_args[template_unpack]
+        else:
+            # A special case for a variadic actual tuple unpack, we can infer T <: X from
+            # tuple[..., *tuple[T, ...], ...] <: tuple[..., *tuple[X, ...], ...] etc.
+            actual_unpack_type = actual_args[actual_unpack]
+            assert isinstance(actual_unpack_type, UnpackType)
+            a_unpacked = get_proper_type(actual_unpack_type.type)
+            if isinstance(a_unpacked, Instance) and a_unpacked.type.fullname == "builtins.tuple":
+                t_unpack = template_args[template_unpack]
+                # In this case we can "eat away" as much as we need.
+                common_prefix = template_prefix
+                common_suffix = template_suffix
 
     # Handle constraints from prefixes/suffixes first.
     start, middle, end = split_with_prefix_and_suffix(
@@ -1500,18 +1692,6 @@ def build_constraints_for_simple_unpack(
                         res.extend(infer_constraints(tp.args[0], a_tp.args[0], direction))
         elif isinstance(tp, TypeVarTupleType):
             res.append(Constraint(tp, direction, TupleType(list(middle), tp.tuple_fallback)))
-    elif actual_unpack is not None:
-        # A special case for a variadic tuple unpack, we simply infer T <: X from
-        # Tuple[..., *tuple[T, ...], ...] <: Tuple[..., *tuple[X, ...], ...].
-        actual_unpack_type = actual_args[actual_unpack]
-        assert isinstance(actual_unpack_type, UnpackType)
-        a_unpacked = get_proper_type(actual_unpack_type.type)
-        if isinstance(a_unpacked, Instance) and a_unpacked.type.fullname == "builtins.tuple":
-            t_unpack = template_args[template_unpack]
-            assert isinstance(t_unpack, UnpackType)
-            tp = get_proper_type(t_unpack.type)
-            if isinstance(tp, Instance) and tp.type.fullname == "builtins.tuple":
-                res.extend(infer_constraints(tp.args[0], a_unpacked.args[0], direction))
     return res
 
 

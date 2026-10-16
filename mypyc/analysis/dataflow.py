@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from abc import abstractmethod
-from typing import Dict, Generic, Iterable, Iterator, Set, Tuple, TypeVar
+from collections.abc import Iterable, Iterator, Set as AbstractSet
+from typing import Any, Generic, TypeVar
 
-from mypyc.ir.func_ir import all_values
 from mypyc.ir.ops import (
+    ERR_NEVER,
     Assign,
     AssignMulti,
     BasicBlock,
@@ -17,14 +18,17 @@ from mypyc.ir.ops import (
     Cast,
     ComparisonOp,
     ControlOp,
+    DecRef,
     Extend,
     Float,
     FloatComparisonOp,
     FloatNeg,
     FloatOp,
     GetAttr,
+    GetElement,
     GetElementPtr,
     Goto,
+    IncRef,
     InitStatic,
     Integer,
     IntOp,
@@ -38,16 +42,19 @@ from mypyc.ir.ops import (
     MethodCall,
     Op,
     OpVisitor,
+    PrimitiveOp,
     RaiseStandardError,
     RegisterOp,
     Return,
     SetAttr,
+    SetElement,
     SetMem,
     Truncate,
     TupleGet,
     TupleSet,
     Unborrow,
     Unbox,
+    Undef,
     Unreachable,
     Value,
 )
@@ -76,12 +83,11 @@ class CFG:
         return f"exits: {exits}\nsucc: {self.succ}\npred: {self.pred}"
 
 
-def get_cfg(blocks: list[BasicBlock]) -> CFG:
+def get_cfg(blocks: list[BasicBlock], *, use_yields: bool = False) -> CFG:
     """Calculate basic block control-flow graph.
 
-    The result is a dictionary like this:
-
-         basic block index -> (successors blocks, predecesssor blocks)
+    If use_yields is set, then we treat returns inserted by yields as gotos
+    instead of exits.
     """
     succ_map = {}
     pred_map: dict[BasicBlock, list[BasicBlock]] = {}
@@ -91,7 +97,10 @@ def get_cfg(blocks: list[BasicBlock]) -> CFG:
             isinstance(op, ControlOp) for op in block.ops[:-1]
         ), "Control-flow ops must be at the end of blocks"
 
-        succ = list(block.terminator.targets())
+        if use_yields and isinstance(block.terminator, Return) and block.terminator.yield_target:
+            succ = [block.terminator.yield_target]
+        else:
+            succ = list(block.terminator.targets())
         if not succ:
             exits.add(block)
 
@@ -154,7 +163,7 @@ def cleanup_cfg(blocks: list[BasicBlock]) -> None:
 
 T = TypeVar("T")
 
-AnalysisDict = Dict[Tuple[BasicBlock, int], Set[T]]
+AnalysisDict = dict[tuple[BasicBlock, int], set[T]]
 
 
 class AnalysisResult(Generic[T]):
@@ -166,12 +175,14 @@ class AnalysisResult(Generic[T]):
         return f"before: {self.before}\nafter: {self.after}\n"
 
 
-GenAndKill = Tuple[Set[T], Set[T]]
+GenAndKill = tuple[AbstractSet[T], AbstractSet[T]]
+
+_EMPTY: tuple[frozenset[Any], frozenset[Any]] = (frozenset(), frozenset())
 
 
 class BaseAnalysisVisitor(OpVisitor[GenAndKill[T]]):
     def visit_goto(self, op: Goto) -> GenAndKill[T]:
-        return set(), set()
+        return _EMPTY
 
     @abstractmethod
     def visit_register_op(self, op: RegisterOp) -> GenAndKill[T]:
@@ -188,6 +199,12 @@ class BaseAnalysisVisitor(OpVisitor[GenAndKill[T]]):
     @abstractmethod
     def visit_set_mem(self, op: SetMem) -> GenAndKill[T]:
         raise NotImplementedError
+
+    def visit_inc_ref(self, op: IncRef) -> GenAndKill[T]:
+        return self.visit_register_op(op)
+
+    def visit_dec_ref(self, op: DecRef) -> GenAndKill[T]:
+        return self.visit_register_op(op)
 
     def visit_call(self, op: Call) -> GenAndKill[T]:
         return self.visit_register_op(op)
@@ -234,6 +251,9 @@ class BaseAnalysisVisitor(OpVisitor[GenAndKill[T]]):
     def visit_call_c(self, op: CallC) -> GenAndKill[T]:
         return self.visit_register_op(op)
 
+    def visit_primitive_op(self, op: PrimitiveOp) -> GenAndKill[T]:
+        return self.visit_register_op(op)
+
     def visit_truncate(self, op: Truncate) -> GenAndKill[T]:
         return self.visit_register_op(op)
 
@@ -261,7 +281,13 @@ class BaseAnalysisVisitor(OpVisitor[GenAndKill[T]]):
     def visit_load_mem(self, op: LoadMem) -> GenAndKill[T]:
         return self.visit_register_op(op)
 
+    def visit_get_element(self, op: GetElement) -> GenAndKill[T]:
+        return self.visit_register_op(op)
+
     def visit_get_element_ptr(self, op: GetElementPtr) -> GenAndKill[T]:
+        return self.visit_register_op(op)
+
+    def visit_set_element(self, op: SetElement) -> GenAndKill[T]:
         return self.visit_register_op(op)
 
     def visit_load_address(self, op: LoadAddress) -> GenAndKill[T]:
@@ -294,16 +320,16 @@ class DefinedVisitor(BaseAnalysisVisitor[Value]):
         self.strict_errors = strict_errors
 
     def visit_branch(self, op: Branch) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_return(self, op: Return) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_unreachable(self, op: Unreachable) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_register_op(self, op: RegisterOp) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_assign(self, op: Assign) -> GenAndKill[Value]:
         # Loading an error value may undefine the register.
@@ -314,10 +340,10 @@ class DefinedVisitor(BaseAnalysisVisitor[Value]):
 
     def visit_assign_multi(self, op: AssignMulti) -> GenAndKill[Value]:
         # Array registers are special and we don't track the definedness of them.
-        return set(), set()
+        return _EMPTY
 
     def visit_set_mem(self, op: SetMem) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
 
 def analyze_maybe_defined_regs(
@@ -369,27 +395,27 @@ class BorrowedArgumentsVisitor(BaseAnalysisVisitor[Value]):
         self.args = args
 
     def visit_branch(self, op: Branch) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_return(self, op: Return) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_unreachable(self, op: Unreachable) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_register_op(self, op: RegisterOp) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_assign(self, op: Assign) -> GenAndKill[Value]:
         if op.dest in self.args:
             return set(), {op.dest}
-        return set(), set()
+        return _EMPTY
 
     def visit_assign_multi(self, op: AssignMulti) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_set_mem(self, op: SetMem) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
 
 def analyze_borrowed_arguments(
@@ -412,13 +438,13 @@ def analyze_borrowed_arguments(
 
 class UndefinedVisitor(BaseAnalysisVisitor[Value]):
     def visit_branch(self, op: Branch) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_return(self, op: Return) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_unreachable(self, op: Unreachable) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_register_op(self, op: RegisterOp) -> GenAndKill[Value]:
         return set(), {op} if not op.is_void else set()
@@ -430,34 +456,13 @@ class UndefinedVisitor(BaseAnalysisVisitor[Value]):
         return set(), {op.dest}
 
     def visit_set_mem(self, op: SetMem) -> GenAndKill[Value]:
-        return set(), set()
-
-
-def analyze_undefined_regs(
-    blocks: list[BasicBlock], cfg: CFG, initial_defined: set[Value]
-) -> AnalysisResult[Value]:
-    """Calculate potentially undefined registers at each CFG location.
-
-    A register is undefined if there is some path from initial block
-    where it has an undefined value.
-
-    Function arguments are assumed to be always defined.
-    """
-    initial_undefined = set(all_values([], blocks)) - initial_defined
-    return run_analysis(
-        blocks=blocks,
-        cfg=cfg,
-        gen_and_kill=UndefinedVisitor(),
-        initial=initial_undefined,
-        backward=False,
-        kind=MAYBE_ANALYSIS,
-    )
+        return _EMPTY
 
 
 def non_trivial_sources(op: Op) -> set[Value]:
     result = set()
     for source in op.sources():
-        if not isinstance(source, (Integer, Float)):
+        if not isinstance(source, (Integer, Float, Undef)):
             result.add(source)
     return result
 
@@ -470,10 +475,10 @@ class LivenessVisitor(BaseAnalysisVisitor[Value]):
         if not isinstance(op.value, (Integer, Float)):
             return {op.value}, set()
         else:
-            return set(), set()
+            return _EMPTY
 
     def visit_unreachable(self, op: Unreachable) -> GenAndKill[Value]:
-        return set(), set()
+        return _EMPTY
 
     def visit_register_op(self, op: RegisterOp) -> GenAndKill[Value]:
         gen = non_trivial_sources(op)
@@ -491,6 +496,12 @@ class LivenessVisitor(BaseAnalysisVisitor[Value]):
     def visit_set_mem(self, op: SetMem) -> GenAndKill[Value]:
         return non_trivial_sources(op), set()
 
+    def visit_inc_ref(self, op: IncRef) -> GenAndKill[Value]:
+        return _EMPTY
+
+    def visit_dec_ref(self, op: DecRef) -> GenAndKill[Value]:
+        return _EMPTY
+
 
 def analyze_live_regs(blocks: list[BasicBlock], cfg: CFG) -> AnalysisResult[Value]:
     """Calculate live registers at each CFG location.
@@ -506,6 +517,55 @@ def analyze_live_regs(blocks: list[BasicBlock], cfg: CFG) -> AnalysisResult[Valu
         backward=True,
         kind=MAYBE_ANALYSIS,
     )
+
+
+def analyze_live_regs_with_exception_edges(
+    blocks: list[BasicBlock],
+) -> dict[BasicBlock, set[Value]]:
+    """Calculate block-entry liveness before exception handling is inserted.
+
+    Unlike get_cfg(), this models an error edge at each operation that can
+    raise. This matters when an assignment later in the same block overwrites a
+    value that the error handler can still read. Returns inserted for a yield
+    are treated as edges to their continuation blocks.
+
+    TODO: Unlike run_analysis(), this supports edges from the middle of basic
+          blocks, so we reimplement data flow analysis here. Figure out a way
+          to unify this with run_analysis().
+    """
+    visitor = LivenessVisitor()
+    live_in: dict[BasicBlock, set[Value]] = {block: set() for block in blocks}
+
+    while True:
+        changed = False
+        for block in reversed(blocks):
+            terminator = block.terminator
+            if isinstance(terminator, Return) and terminator.yield_target is not None:
+                successors = (terminator.yield_target,)
+            else:
+                successors = terminator.targets()
+
+            live: set[Value] = set()
+            for successor in successors:
+                live.update(live_in[successor])
+
+            for op in reversed(block.ops):
+                if (
+                    block.error_handler is not None
+                    and isinstance(op, RegisterOp)
+                    and op.error_kind != ERR_NEVER
+                ):
+                    live.update(live_in[block.error_handler])
+                gen, kill = op.accept(visitor)
+                live.difference_update(kill)
+                live.update(gen)
+
+            if live != live_in[block]:
+                live_in[block] = live
+                changed = True
+
+        if not changed:
+            return live_in
 
 
 # Analysis kinds
@@ -551,15 +611,23 @@ def run_analysis(
             ops = list(reversed(ops))
         for op in ops:
             opgen, opkill = op.accept(gen_and_kill)
-            gen = (gen - opkill) | opgen
-            kill = (kill - opgen) | opkill
+            if opkill:
+                gen -= opkill
+
+            if opgen:
+                gen |= opgen
+                kill -= opgen
+
+            if opkill:
+                kill |= opkill
+
         block_gen[block] = gen
         block_kill[block] = kill
 
     # Set up initial state for worklist algorithm.
     worklist = list(blocks)
     if not backward:
-        worklist = worklist[::-1]  # Reverse for a small performance improvement
+        worklist.reverse()  # Reverse for a small performance improvement
     workset = set(worklist)
     before: dict[BasicBlock, set[T]] = {}
     after: dict[BasicBlock, set[T]] = {}
@@ -616,7 +684,10 @@ def run_analysis(
         for idx, op in ops_enum:
             op_before[label, idx] = cur
             opgen, opkill = op.accept(gen_and_kill)
-            cur = (cur - opkill) | opgen
+            if opkill:
+                cur = cur - opkill
+            if opgen:
+                cur = cur | opgen
             op_after[label, idx] = cur
     if backward:
         op_after, op_before = op_before, op_after

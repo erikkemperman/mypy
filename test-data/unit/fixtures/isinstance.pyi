@@ -1,3 +1,4 @@
+import types
 from typing import Tuple, TypeVar, Generic, Union, cast, Any, Type
 
 T = TypeVar('T')
@@ -7,6 +8,7 @@ class object:
 
 class type:
     def __init__(self, x) -> None: pass
+    def __or__(self, other: type) -> type: pass
 
 class tuple(Generic[T]): pass
 
@@ -21,8 +23,8 @@ class int:
 class float: pass
 class bool(int): pass
 class str:
+    def __new__(cls, o: object = ...) -> str: pass
     def __add__(self, other: 'str') -> 'str': pass
-class ellipsis: pass
 
 NotImplemented = cast(Any, None)
 

@@ -35,7 +35,7 @@ class TypeExportSuite(DataSuite):
             options.export_types = True
             options.preserve_asts = True
             options.allow_empty_bodies = True
-            options.force_uppercase_builtins = True
+            options.reveal_verbose_types = True
             result = build.build(
                 sources=[BuildSource("main", None, src)],
                 options=options,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 from mypy.argmap import map_actuals_to_formals
-from mypy.fixup import TypeFixer
+from mypy.modules_state import modules_state
 from mypy.nodes import (
     ARG_POS,
     MDEF,
@@ -164,7 +164,7 @@ def find_shallow_matching_overload_item(overload: Overloaded, call: CallExpr) ->
 
 
 def _get_callee_type(call: CallExpr) -> CallableType | None:
-    """Return the type of the callee, regardless of its syntatic form."""
+    """Return the type of the callee, regardless of its syntactic form."""
 
     callee_node: Node | None = call.callee
 
@@ -282,7 +282,6 @@ def add_overloaded_method_to_class(
             var = Var(func.name, func.type)
             var.set_line(func.line)
             func.is_decorated = True
-            func.deco_line = func.line
 
             deco = Decorator(func, [], var)
         else:
@@ -361,7 +360,7 @@ def _add_method_by_spec(
 
     signature = CallableType(arg_types, arg_kinds, arg_names, return_type, function_type)
     if tvar_defs:
-        signature.variables = tvar_defs
+        signature.variables = tuple(tvar_defs)
 
     func = FuncDef(name, args, Block([PassStmt()]))
     func.info = info
@@ -434,7 +433,9 @@ def add_attribute_to_class(
     return node
 
 
+# We keep the unused `api` parameter, to avoid breaking 3rd party dataclass-like plugins.
 def deserialize_and_fixup_type(data: str | JsonDict, api: SemanticAnalyzerPluginInterface) -> Type:
     typ = deserialize_type(data)
-    typ.accept(TypeFixer(api.modules, allow_missing=False))
+    assert modules_state.node_fixer is not None
+    typ.accept(modules_state.node_fixer.type_fixer)
     return typ

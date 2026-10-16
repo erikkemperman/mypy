@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Any, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import mypy.nodes
 from mypy.options import Options
@@ -86,6 +87,9 @@ class StrConv(NodeVisitor[str]):
             elif kind == mypy.nodes.ARG_STAR2:
                 extra.append(("DictVarArg", [arg.variable]))
         a: list[Any] = []
+        if o.type_args:
+            for p in o.type_args:
+                a.append(self.type_param(p))
         if args:
             a.append(("Args", args))
         if o.type:
@@ -109,7 +113,7 @@ class StrConv(NodeVisitor[str]):
         if o.path != "main":
             # Insert path. Normalize directory separators to / to unify test
             # case# output in all platforms.
-            a.insert(0, o.path.replace(os.sep, "/"))
+            a.insert(0, o.path.replace(os.getcwd() + os.sep, "").replace(os.sep, "/"))
         if o.ignored_lines:
             a.append("IgnoredLines(%s)" % ", ".join(str(line) for line in sorted(o.ignored_lines)))
         return self.dump(a, o)
@@ -143,6 +147,8 @@ class StrConv(NodeVisitor[str]):
         arg_kinds = {arg.kind for arg in o.arguments}
         if len(arg_kinds & {mypy.nodes.ARG_NAMED, mypy.nodes.ARG_NAMED_OPT}) > 0:
             a.insert(1, f"MaxPos({o.max_pos})")
+        if o.is_coroutine:
+            a.insert(1, "Async")
         if o.abstract_status in (mypy.nodes.IS_ABSTRACT, mypy.nodes.IMPLICITLY_ABSTRACT):
             a.insert(-1, "Abstract")
         if o.is_static:
@@ -179,6 +185,9 @@ class StrConv(NodeVisitor[str]):
             a.insert(1, ("TypeVars", o.type_vars))
         if o.metaclass:
             a.insert(1, f"Metaclass({o.metaclass.accept(self)})")
+        if o.keywords:
+            keyword_items = [f"{k}={v.accept(self)}" for k, v in o.keywords.items()]
+            a.insert(1, f"Keywords({', '.join(keyword_items)})")
         if o.decorators:
             a.insert(1, ("Decorators", o.decorators))
         if o.info and o.info._promote:
@@ -187,6 +196,9 @@ class StrConv(NodeVisitor[str]):
             a.insert(1, ("TupleType", [o.info.tuple_type]))
         if o.info and o.info.fallback_to_any:
             a.insert(1, "FallbackToAny")
+        if o.type_args:
+            for p in reversed(o.type_args):
+                a.insert(1, self.type_param(p))
         return self.dump(a, o)
 
     def visit_var(self, o: mypy.nodes.Var) -> str:
@@ -205,6 +217,12 @@ class StrConv(NodeVisitor[str]):
 
     def visit_decorator(self, o: mypy.nodes.Decorator) -> str:
         return self.dump([o.var, o.decorators, o.func], o)
+
+    def visit_type_alias(self, o: mypy.nodes.TypeAlias, /) -> str:
+        return self.dump([o.name, o.target, o.alias_tvars, o.no_args], o)
+
+    def visit_placeholder_node(self, o: mypy.nodes.PlaceholderNode, /) -> str:
+        return self.dump([o.fullname], o)
 
     # Statements
 
@@ -323,6 +341,30 @@ class StrConv(NodeVisitor[str]):
             a.append(("Body", o.bodies[i].body))
         return self.dump(a, o)
 
+    def visit_type_alias_stmt(self, o: mypy.nodes.TypeAliasStmt) -> str:
+        a: list[Any] = [o.name]
+        for p in o.type_args:
+            a.append(self.type_param(p))
+        a.append(o.value)
+        return self.dump(a, o)
+
+    def type_param(self, p: mypy.nodes.TypeParam) -> list[Any]:
+        a: list[Any] = []
+        if p.kind == mypy.nodes.PARAM_SPEC_KIND:
+            prefix = "**"
+        elif p.kind == mypy.nodes.TYPE_VAR_TUPLE_KIND:
+            prefix = "*"
+        else:
+            prefix = ""
+        a.append(prefix + p.name)
+        if p.upper_bound:
+            a.append(p.upper_bound)
+        if p.values:
+            a.append(("Values", p.values))
+        if p.default:
+            a.append(("Default", [p.default]))
+        return [("TypeParam", a)]
+
     # Expressions
 
     # Simple expressions
@@ -357,7 +399,9 @@ class StrConv(NodeVisitor[str]):
             o.name, o.kind, o.fullname, o.is_inferred_def or o.is_special_form, o.node
         )
         if isinstance(o.node, mypy.nodes.Var) and o.node.is_final:
-            pretty += f" = {o.node.final_value}"
+            final_value = o.node.final_value
+            if final_value is not None:
+                pretty += f" = {o.node.final_value}"
         return short_type(o) + "(" + pretty + ")"
 
     def pretty_name(
@@ -433,6 +477,9 @@ class StrConv(NodeVisitor[str]):
     def visit_cast_expr(self, o: mypy.nodes.CastExpr) -> str:
         return self.dump([o.expr, o.type], o)
 
+    def visit_type_form_expr(self, o: mypy.nodes.TypeFormExpr) -> str:
+        return self.dump([o.type], o)
+
     def visit_assert_type_expr(self, o: mypy.nodes.AssertTypeExpr) -> str:
         return self.dump([o.expr, o.type], o)
 
@@ -454,6 +501,25 @@ class StrConv(NodeVisitor[str]):
 
     def visit_dict_expr(self, o: mypy.nodes.DictExpr) -> str:
         return self.dump([[k, v] for k, v in o.items], o)
+
+    def visit_template_str_expr(self, o: mypy.nodes.TemplateStrExpr) -> str:
+        items_repr: list[object] = []
+        for item in o.items:
+            if isinstance(item, tuple):
+                value_expr, source, conversion, format_spec = item
+                interpolation: list[object] = [
+                    ("Value", [value_expr]),
+                    f"Source({source!r})",
+                    f"Conversion({conversion!r})",
+                ]
+                if format_spec is None:
+                    interpolation.append("FormatSpec(None)")
+                else:
+                    interpolation.append(("FormatSpec", [format_spec]))
+                items_repr.append(("Interpolation", interpolation))
+            else:
+                items_repr.append(item)
+        return self.dump(items_repr, o)
 
     def visit_set_expr(self, o: mypy.nodes.SetExpr) -> str:
         return self.dump(o.items, o)

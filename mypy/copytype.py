@@ -53,7 +53,7 @@ class TypeShallowCopier(TypeVisitor[ProperType]):
         return self.copy_common(t, NoneType())
 
     def visit_uninhabited_type(self, t: UninhabitedType) -> ProperType:
-        dup = UninhabitedType(t.is_noreturn)
+        dup = UninhabitedType()
         dup.ambiguous = t.ambiguous
         return self.copy_common(t, dup)
 
@@ -65,7 +65,6 @@ class TypeShallowCopier(TypeVisitor[ProperType]):
 
     def visit_instance(self, t: Instance) -> ProperType:
         dup = Instance(t.type, t.args, last_known_value=t.last_known_value)
-        dup.invalid = t.invalid
         return self.copy_common(t, dup)
 
     def visit_type_var(self, t: TypeVarType) -> ProperType:
@@ -107,7 +106,12 @@ class TypeShallowCopier(TypeVisitor[ProperType]):
         return self.copy_common(t, TupleType(t.items, t.partial_fallback, implicit=t.implicit))
 
     def visit_typeddict_type(self, t: TypedDictType) -> ProperType:
-        return self.copy_common(t, TypedDictType(t.items, t.required_keys, t.fallback))
+        return self.copy_common(
+            t,
+            TypedDictType(
+                t.items, t.required_keys, t.readonly_keys, t.fallback, is_closed=t.is_closed
+            ),
+        )
 
     def visit_literal_type(self, t: LiteralType) -> ProperType:
         return self.copy_common(t, LiteralType(value=t.value, fallback=t.fallback))
@@ -116,11 +120,11 @@ class TypeShallowCopier(TypeVisitor[ProperType]):
         return self.copy_common(t, UnionType(t.items))
 
     def visit_overloaded(self, t: Overloaded) -> ProperType:
-        return self.copy_common(t, Overloaded(items=t.items))
+        return self.copy_common(t, Overloaded(items=t.items, bound_args=t.bound_args))
 
     def visit_type_type(self, t: TypeType) -> ProperType:
         # Use cast since the type annotations in TypeType are imprecise.
-        return self.copy_common(t, TypeType(cast(Any, t.item)))
+        return self.copy_common(t, TypeType(cast(Any, t.item), is_type_form=t.is_type_form))
 
     def visit_type_alias_type(self, t: TypeAliasType) -> ProperType:
         assert False, "only ProperTypes supported"

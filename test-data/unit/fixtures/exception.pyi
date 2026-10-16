@@ -1,4 +1,5 @@
 import sys
+import types
 from typing import Generic, TypeVar
 T = TypeVar('T')
 
@@ -12,9 +13,9 @@ class list: pass
 class dict: pass
 class function: pass
 class int: pass
+class float: pass
 class str: pass
 class bool: pass
-class ellipsis: pass
 
 class BaseException:
     def __init__(self, *args: object) -> None: ...

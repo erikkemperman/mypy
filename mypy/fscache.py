@@ -51,8 +51,8 @@ class FileSystemCache:
 
     def flush(self) -> None:
         """Start another transaction and empty all caches."""
-        self.stat_cache: dict[str, os.stat_result] = {}
-        self.stat_error_cache: dict[str, OSError] = {}
+        self.stat_or_none_cache: dict[str, os.stat_result | None] = {}
+
         self.listdir_cache: dict[str, list[str]] = {}
         self.listdir_error_cache: dict[str, OSError] = {}
         self.isfile_case_cache: dict[str, bool] = {}
@@ -62,24 +62,21 @@ class FileSystemCache:
         self.hash_cache: dict[str, str] = {}
         self.fake_package_cache: set[str] = set()
 
-    def stat(self, path: str) -> os.stat_result:
-        if path in self.stat_cache:
-            return self.stat_cache[path]
-        if path in self.stat_error_cache:
-            raise copy_os_error(self.stat_error_cache[path])
+    def stat_or_none(self, path: str) -> os.stat_result | None:
+        if path in self.stat_or_none_cache:
+            return self.stat_or_none_cache[path]
+
+        st = None
         try:
             st = os.stat(path)
-        except OSError as err:
+        except OSError:
             if self.init_under_package_root(path):
                 try:
-                    return self._fake_init(path)
+                    st = self._fake_init(path)
                 except OSError:
                     pass
-            # Take a copy to get rid of associated traceback and frame objects.
-            # Just assigning to __traceback__ doesn't free them.
-            self.stat_error_cache[path] = copy_os_error(err)
-            raise err
-        self.stat_cache[path] = st
+
+        self.stat_or_none_cache[path] = st
         return st
 
     def init_under_package_root(self, path: str) -> bool:
@@ -101,7 +98,7 @@ class FileSystemCache:
         necessary for mypy to properly distinguish packages from other
         directories.
 
-        See https://docs.bazel.build/versions/master/be/python.html,
+        See https://bazel.build/reference/be/python,
         where this behavior is described under legacy_create_init.
         """
         if not self.package_root:
@@ -112,15 +109,20 @@ class FileSystemCache:
         if not os.path.basename(dirname).isidentifier():
             # Can't put an __init__.py in a place that's not an identifier
             return False
-        try:
-            st = self.stat(dirname)
-        except OSError:
+
+        st = self.stat_or_none(dirname)
+        if st is None:
             return False
         else:
             if not stat.S_ISDIR(st.st_mode):
                 return False
         ok = False
-        drive, path = os.path.splitdrive(path)  # Ignore Windows drive name
+
+        # skip if on a different drive
+        current_drive, _ = os.path.splitdrive(os.getcwd())
+        drive, _ = os.path.splitdrive(path)
+        if drive != current_drive:
+            return False
         if os.path.isabs(path):
             path = os.path.relpath(path)
         path = os.path.normpath(path)
@@ -145,7 +147,7 @@ class FileSystemCache:
         assert basename == "__init__.py", path
         assert not os.path.exists(path), path  # Not cached!
         dirname = os.path.normpath(dirname)
-        st = self.stat(dirname)  # May raise OSError
+        st = os.stat(dirname)  # May raise OSError
         # Get stat result as a list so we can modify it.
         seq: list[float] = list(st)
         seq[stat.ST_MODE] = stat.S_IFREG | 0o444
@@ -153,7 +155,6 @@ class FileSystemCache:
         seq[stat.ST_NLINK] = 1
         seq[stat.ST_SIZE] = 0
         st = os.stat_result(seq)
-        self.stat_cache[path] = st
         # Make listdir() and read() also pretend this file exists.
         self.fake_package_cache.add(dirname)
         return st
@@ -181,9 +182,8 @@ class FileSystemCache:
         return results
 
     def isfile(self, path: str) -> bool:
-        try:
-            st = self.stat(path)
-        except OSError:
+        st = self.stat_or_none(path)
+        if st is None:
             return False
         return stat.S_ISREG(st.st_mode)
 
@@ -248,17 +248,18 @@ class FileSystemCache:
         return res
 
     def isdir(self, path: str) -> bool:
-        try:
-            st = self.stat(path)
-        except OSError:
+        st = self.stat_or_none(path)
+        if st is None:
             return False
         return stat.S_ISDIR(st.st_mode)
 
-    def exists(self, path: str) -> bool:
-        try:
-            self.stat(path)
-        except FileNotFoundError:
+    def exists(self, path: str, real_only: bool = False) -> bool:
+        st = self.stat_or_none(path)
+        if st is None:
             return False
+        if real_only:
+            dirname = os.path.dirname(path)
+            return dirname not in self.fake_package_cache
         return True
 
     def read(self, path: str) -> bytes:
@@ -269,7 +270,7 @@ class FileSystemCache:
 
         # Need to stat first so that the contents of file are from no
         # earlier instant than the mtime reported by self.stat().
-        self.stat(path)
+        self.stat_or_none(path)
 
         dirname, basename = os.path.split(path)
         dirname = os.path.normpath(dirname)
@@ -294,8 +295,10 @@ class FileSystemCache:
         return self.hash_cache[path]
 
     def samefile(self, f1: str, f2: str) -> bool:
-        s1 = self.stat(f1)
-        s2 = self.stat(f2)
+        s1 = self.stat_or_none(f1)
+        s2 = self.stat_or_none(f2)
+        if s1 is None or s2 is None:
+            return False
         return os.path.samestat(s1, s2)
 
 

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import sys
 import traceback
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator, NoReturn
+from typing import NoReturn
 
 
 @contextmanager
@@ -28,4 +29,8 @@ def crash_report(module_path: str, line: int) -> NoReturn:
     for s in traceback.format_list(tb + tb2):
         print(s.rstrip("\n"))
     print(f"{module_path}:{line}: {type(err).__name__}: {err}")
+    print(
+        f"{module_path}:{line}: note: this is an internal mypyc error; "
+        "please report a bug at https://github.com/mypyc/mypyc/issues"
+    )
     raise SystemExit(2)

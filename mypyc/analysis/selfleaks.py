@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from typing import Set, Tuple
-
-from mypyc.analysis.dataflow import CFG, MAYBE_ANALYSIS, AnalysisResult, run_analysis
+from mypyc.analysis.dataflow import (
+    CFG,
+    MAYBE_ANALYSIS,
+    AnalysisResult,
+    GenAndKill as _DataflowGenAndKill,
+    run_analysis,
+)
 from mypyc.ir.ops import (
     Assign,
     AssignMulti,
@@ -13,13 +17,16 @@ from mypyc.ir.ops import (
     CallC,
     Cast,
     ComparisonOp,
+    DecRef,
     Extend,
     FloatComparisonOp,
     FloatNeg,
     FloatOp,
     GetAttr,
+    GetElement,
     GetElementPtr,
     Goto,
+    IncRef,
     InitStatic,
     IntOp,
     KeepAlive,
@@ -31,11 +38,13 @@ from mypyc.ir.ops import (
     LoadStatic,
     MethodCall,
     OpVisitor,
+    PrimitiveOp,
     RaiseStandardError,
     Register,
     RegisterOp,
     Return,
     SetAttr,
+    SetElement,
     SetMem,
     Truncate,
     TupleGet,
@@ -46,7 +55,7 @@ from mypyc.ir.ops import (
 )
 from mypyc.ir.rtypes import RInstance
 
-GenAndKill = Tuple[Set[None], Set[None]]
+GenAndKill = _DataflowGenAndKill[None]
 
 CLEAN: GenAndKill = (set(), set())
 DIRTY: GenAndKill = ({None}, {None})
@@ -89,11 +98,17 @@ class SelfLeakedVisitor(OpVisitor[GenAndKill]):
     def visit_set_mem(self, op: SetMem) -> GenAndKill:
         return CLEAN
 
+    def visit_inc_ref(self, op: IncRef) -> GenAndKill:
+        return CLEAN
+
+    def visit_dec_ref(self, op: DecRef) -> GenAndKill:
+        return CLEAN
+
     def visit_call(self, op: Call) -> GenAndKill:
         fn = op.fn
         if fn.class_name and fn.name == "__init__":
             self_type = op.fn.sig.args[0].type
-            assert isinstance(self_type, RInstance)
+            assert isinstance(self_type, RInstance), self_type
             cl = self_type.class_ir
             if not cl.init_self_leak:
                 return CLEAN
@@ -149,6 +164,9 @@ class SelfLeakedVisitor(OpVisitor[GenAndKill]):
     def visit_call_c(self, op: CallC) -> GenAndKill:
         return self.check_register_op(op)
 
+    def visit_primitive_op(self, op: PrimitiveOp) -> GenAndKill:
+        return self.check_register_op(op)
+
     def visit_truncate(self, op: Truncate) -> GenAndKill:
         return CLEAN
 
@@ -176,7 +194,13 @@ class SelfLeakedVisitor(OpVisitor[GenAndKill]):
     def visit_load_mem(self, op: LoadMem) -> GenAndKill:
         return CLEAN
 
+    def visit_get_element(self, op: GetElement) -> GenAndKill:
+        return CLEAN
+
     def visit_get_element_ptr(self, op: GetElementPtr) -> GenAndKill:
+        return CLEAN
+
+    def visit_set_element(self, op: SetElement) -> GenAndKill:
         return CLEAN
 
     def visit_load_address(self, op: LoadAddress) -> GenAndKill:

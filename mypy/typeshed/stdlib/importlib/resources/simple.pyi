@@ -1,9 +1,9 @@
 import abc
 import sys
-from _typeshed import Incomplete, OpenBinaryMode, OpenTextMode, Unused
+from _typeshed import StrPath
 from collections.abc import Iterator
 from io import TextIOWrapper
-from typing import IO, Any, BinaryIO, Literal, NoReturn, overload
+from typing import IO, Any, BinaryIO, Literal, overload
 from typing_extensions import Never
 
 if sys.version_info >= (3, 11):
@@ -27,13 +27,23 @@ if sys.version_info >= (3, 11):
         def __init__(self, parent: ResourceContainer, name: str) -> None: ...
         def is_file(self) -> Literal[True]: ...
         def is_dir(self) -> Literal[False]: ...
+
         @overload
-        def open(self, mode: OpenTextMode = "r", *args: Incomplete, **kwargs: Incomplete) -> TextIOWrapper: ...
+        def open(
+            self,
+            mode: Literal["r"] = "r",
+            encoding: str | None = None,
+            errors: str | None = None,
+            newline: str | None = None,
+            line_buffering: bool = False,
+            write_through: bool = False,
+        ) -> TextIOWrapper: ...
         @overload
-        def open(self, mode: OpenBinaryMode, *args: Unused, **kwargs: Unused) -> BinaryIO: ...
+        def open(self, mode: Literal["rb"]) -> BinaryIO: ...
         @overload
-        def open(self, mode: str, *args: Incomplete, **kwargs: Incomplete) -> IO[Any]: ...
-        def joinpath(self, name: Never) -> NoReturn: ...  # type: ignore[override]
+        def open(self, mode: str) -> IO[Any]: ...
+
+        def joinpath(self, name: Never) -> Never: ...  # type: ignore[override]
 
     class ResourceContainer(Traversable, metaclass=abc.ABCMeta):
         reader: SimpleReader
@@ -41,9 +51,9 @@ if sys.version_info >= (3, 11):
         def is_dir(self) -> Literal[True]: ...
         def is_file(self) -> Literal[False]: ...
         def iterdir(self) -> Iterator[ResourceHandle | ResourceContainer]: ...
-        def open(self, *args: Never, **kwargs: Never) -> NoReturn: ...  # type: ignore[override]
+        def open(self, *args: Never, **kwargs: Never) -> Never: ...  # type: ignore[override]
         if sys.version_info < (3, 12):
-            def joinpath(self, *descendants: str) -> Traversable: ...
+            def joinpath(self, *descendants: StrPath) -> Traversable: ...
 
     class TraversableReader(TraversableResources, SimpleReader, metaclass=abc.ABCMeta):
         def files(self) -> ResourceContainer: ...

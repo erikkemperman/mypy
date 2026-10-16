@@ -186,8 +186,27 @@ L0:
     big5 = r4
     return 1
 
+[case testConstantFoldFormatArgs]
+# This only tests that the callee and args are constant folded,
+# it is not intended to test the result.
+from typing import Any, Final
+
+FMT: Final = "{} {}"
+
+def f() -> str:
+    return FMT.format(400 + 20, "roll" + "up")
+[out]
+def f():
+    r0, r1, r2, r3 :: str
+L0:
+    r0 = CPyTagged_Str(840)
+    r1 = 'rollup'
+    r2 = ' '
+    r3 = CPyStr_Build(3, r0, r2, r1)
+    return r3
+
 [case testIntConstantFoldingFinal]
-from typing_extensions import Final
+from typing import Final
 X: Final = 5
 Y: Final = 2 + 4
 
@@ -203,18 +222,13 @@ L0:
     return 1
 
 [case testIntConstantFoldingClassFinal]
-from typing_extensions import Final
+from typing import Final
 class C:
     X: Final = 5
 
 def f() -> None:
     a = C.X + 1
 [out]
-def C.__mypyc_defaults_setup(__mypyc_self__):
-    __mypyc_self__ :: __main__.C
-L0:
-    __mypyc_self__.X = 10
-    return 1
 def f():
     a :: int
 L0:
@@ -222,7 +236,7 @@ L0:
     return 1
 
 [case testFloatConstantFolding]
-from typing_extensions import Final
+from typing import Final
 
 N: Final = 1.5
 N2: Final = 1.5 * 2
@@ -391,7 +405,7 @@ L2:
     return 1
 
 [case testStrConstantFolding]
-from typing_extensions import Final
+from typing import Final
 
 S: Final = 'z'
 N: Final = 2
@@ -416,7 +430,7 @@ L0:
     return 1
 
 [case testBytesConstantFolding]
-from typing_extensions import Final
+from typing import Final
 
 N: Final = 2
 
@@ -438,7 +452,7 @@ L0:
     return 1
 
 [case testComplexConstantFolding]
-from typing_extensions import Final
+from typing import Final
 
 N: Final = 1
 FLOAT_N: Final = 1.5

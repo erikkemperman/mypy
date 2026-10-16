@@ -5,18 +5,20 @@ import unittest.result
 import unittest.suite
 from collections.abc import Iterable
 from types import ModuleType
-from typing import Any, Protocol
+from typing import Any, Final, Protocol, type_check_only
+from typing_extensions import deprecated
 
-MAIN_EXAMPLES: str
-MODULE_EXAMPLES: str
+MAIN_EXAMPLES: Final[str]
+MODULE_EXAMPLES: Final[str]
 
+@type_check_only
 class _TestRunner(Protocol):
-    def run(self, __test: unittest.suite.TestSuite | unittest.case.TestCase) -> unittest.result.TestResult: ...
+    def run(self, test: unittest.suite.TestSuite | unittest.case.TestCase, /) -> unittest.result.TestResult: ...
 
 # not really documented
 class TestProgram:
     result: unittest.result.TestResult
-    module: None | str | ModuleType
+    module: ModuleType | None
     verbosity: int
     failfast: bool | None
     catchbreak: bool | None
@@ -28,7 +30,7 @@ class TestProgram:
         durations: unittest.result._DurationsType | None
         def __init__(
             self,
-            module: None | str | ModuleType = "__main__",
+            module: ModuleType | str | None = "__main__",
             defaultTest: str | Iterable[str] | None = None,
             argv: list[str] | None = None,
             testRunner: type[_TestRunner] | _TestRunner | None = None,
@@ -61,7 +63,10 @@ class TestProgram:
             tb_locals: bool = False,
         ) -> None: ...
 
-    def usageExit(self, msg: Any = None) -> None: ...
+    if sys.version_info < (3, 13):
+        @deprecated("Deprecated; removed in Python 3.13.")
+        def usageExit(self, msg: Any = None) -> None: ...
+
     def parseArgs(self, argv: list[str]) -> None: ...
     def createTests(self, from_discovery: bool = False, Loader: unittest.loader.TestLoader | None = None) -> None: ...
     def runTests(self) -> None: ...  # undocumented

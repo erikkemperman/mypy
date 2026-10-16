@@ -56,7 +56,7 @@ Examples of locations:
 * 'mod.Cls' represents each method in class 'mod.Cls' + the top-level of the
   module 'mod'. (To simplify the implementation, there is no location that only
   includes the body of a class without the entire surrounding module top level.)
-* Trigger '<...>' as a location is an indirect way of referring to to all
+* Trigger '<...>' as a location is an indirect way of referring to all
   locations triggered by the trigger. These indirect locations keep the
   dependency map smaller and easier to manage.
 
@@ -82,12 +82,12 @@ Test cases for this module live in 'test-data/unit/deps*.test'.
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import List
 
 from mypy.nodes import (
     GDEF,
     LDEF,
     MDEF,
+    SYMBOL_FUNCBASE_TYPES,
     AssertTypeExpr,
     AssignmentStmt,
     AwaitExpr,
@@ -125,6 +125,7 @@ from mypy.nodes import (
     TypeAliasExpr,
     TypeApplication,
     TypedDictExpr,
+    TypeFormExpr,
     TypeInfo,
     TypeVarExpr,
     UnaryExpr,
@@ -157,6 +158,7 @@ from mypy.types import (
     ParamSpecType,
     PartialType,
     ProperType,
+    SentinelValue,
     TupleType,
     Type,
     TypeAliasType,
@@ -227,14 +229,17 @@ class DependencyVisitor(TraverserVisitor):
         self.scope = Scope()
         self.type_map = type_map
         # This attribute holds a mapping from target to names of type aliases
-        # it depends on. These need to be processed specially, since they are
-        # only present in expanded form in symbol tables. For example, after:
-        #    A = List[int]
+        # it depends on. These need to be processed specially, since they may
+        # appear in expanded form in symbol tables, because of a get_proper_type()
+        # somewhere. For example, after:
+        #    A = int
         #    x: A
-        # The module symbol table will just have a Var `x` with type `List[int]`,
-        # and the dependency of `x` on `A` is lost. Therefore the alias dependencies
+        # the module symbol table will just have a Var `x` with type `int`,
+        # and the dependency of `x` on `A` is lost. Therefore, the alias dependencies
         # are preserved at alias expansion points in `semanal.py`, stored as an attribute
         # on MypyFile, and then passed here.
+        # TODO: fine-grained is more susceptible to this partially because we are reckless
+        # about get_proper_type() in *this specific file*.
         self.alias_deps = alias_deps
         self.map: dict[str, set[str]] = {}
         self.is_class = False
@@ -502,7 +507,7 @@ class DependencyVisitor(TraverserVisitor):
                 if isinstance(rvalue.callee.node, TypeInfo):
                     # use actual __init__ as a dependency source
                     init = rvalue.callee.node.get("__init__")
-                    if init and isinstance(init.node, FuncBase):
+                    if init and isinstance(init.node, SYMBOL_FUNCBASE_TYPES):
                         fname = init.node.fullname
                 else:
                     fname = rvalue.callee.fullname
@@ -667,6 +672,13 @@ class DependencyVisitor(TraverserVisitor):
         if e.kind is not None:
             # Reference to a module attribute
             self.process_global_ref_expr(e)
+            if isinstance(e.expr, RefExpr) and isinstance(e.expr.node, MypyFile):
+                # Also depend on the name as accessed through this module. The
+                # fullname above may point to the original definition (e.g. via
+                # a re-export using "from ... import *"), but we must also
+                # recheck if the name is removed from the accessed module's
+                # namespace.
+                self.add_dependency(make_trigger(e.expr.node.fullname + "." + e.name))
         else:
             # Reference to a non-module (or missing) attribute
             if e.expr not in self.type_map:
@@ -761,6 +773,10 @@ class DependencyVisitor(TraverserVisitor):
 
     def visit_cast_expr(self, e: CastExpr) -> None:
         super().visit_cast_expr(e)
+        self.add_type_dependencies(e.type)
+
+    def visit_type_form_expr(self, e: TypeFormExpr) -> None:
+        super().visit_type_form_expr(e)
         self.add_type_dependencies(e.type)
 
     def visit_assert_type_expr(self, e: AssertTypeExpr) -> None:
@@ -947,7 +963,7 @@ def get_type_triggers(
     return typ.accept(TypeTriggersVisitor(use_logical_deps, seen_aliases))
 
 
-class TypeTriggersVisitor(TypeVisitor[List[str]]):
+class TypeTriggersVisitor(TypeVisitor[list[str]]):
     def __init__(
         self, use_logical_deps: bool, seen_aliases: set[TypeAliasType] | None = None
     ) -> None:
@@ -979,8 +995,6 @@ class TypeTriggersVisitor(TypeVisitor[List[str]]):
         triggers = [trigger]
         for arg in typ.args:
             triggers.extend(self.get_type_triggers(arg))
-        # TODO: Now that type aliases are its own kind of types we can simplify
-        # the logic to rely on intermediate dependencies (like for instance types).
         triggers.extend(self.get_type_triggers(typ.alias.target))
         return triggers
 
@@ -997,6 +1011,12 @@ class TypeTriggersVisitor(TypeVisitor[List[str]]):
         for arg in typ.arg_types:
             triggers.extend(self.get_type_triggers(arg))
         triggers.extend(self.get_type_triggers(typ.ret_type))
+        if typ.type_guard is not None:
+            triggers.extend(self.get_type_triggers(typ.type_guard))
+        if typ.type_is is not None:
+            triggers.extend(self.get_type_triggers(typ.type_is))
+        if typ.instance_type is not None:
+            triggers.extend(self.get_type_triggers(typ.instance_type))
         # fallback is a metaclass type for class objects, and is
         # processed separately.
         return triggers
@@ -1037,10 +1057,8 @@ class TypeTriggersVisitor(TypeVisitor[List[str]]):
         triggers = []
         if typ.fullname:
             triggers.append(make_trigger(typ.fullname))
-        if typ.upper_bound:
-            triggers.extend(self.get_type_triggers(typ.upper_bound))
-        if typ.default:
-            triggers.extend(self.get_type_triggers(typ.default))
+        triggers.extend(self.get_type_triggers(typ.upper_bound))
+        triggers.extend(self.get_type_triggers(typ.default))
         for val in typ.values:
             triggers.extend(self.get_type_triggers(val))
         return triggers
@@ -1049,22 +1067,17 @@ class TypeTriggersVisitor(TypeVisitor[List[str]]):
         triggers = []
         if typ.fullname:
             triggers.append(make_trigger(typ.fullname))
-        if typ.upper_bound:
-            triggers.extend(self.get_type_triggers(typ.upper_bound))
-        if typ.default:
-            triggers.extend(self.get_type_triggers(typ.default))
         triggers.extend(self.get_type_triggers(typ.upper_bound))
+        triggers.extend(self.get_type_triggers(typ.default))
+        triggers.extend(self.get_type_triggers(typ.prefix))
         return triggers
 
     def visit_type_var_tuple(self, typ: TypeVarTupleType) -> list[str]:
         triggers = []
         if typ.fullname:
             triggers.append(make_trigger(typ.fullname))
-        if typ.upper_bound:
-            triggers.extend(self.get_type_triggers(typ.upper_bound))
-        if typ.default:
-            triggers.extend(self.get_type_triggers(typ.default))
         triggers.extend(self.get_type_triggers(typ.upper_bound))
+        triggers.extend(self.get_type_triggers(typ.default))
         return triggers
 
     def visit_unpack_type(self, typ: UnpackType) -> list[str]:
@@ -1084,7 +1097,10 @@ class TypeTriggersVisitor(TypeVisitor[List[str]]):
         return triggers
 
     def visit_literal_type(self, typ: LiteralType) -> list[str]:
-        return self.get_type_triggers(typ.fallback)
+        triggers = self.get_type_triggers(typ.fallback)
+        if isinstance(typ.value, SentinelValue):
+            triggers.append(make_trigger(typ.value.fullname))
+        return triggers
 
     def visit_unbound_type(self, typ: UnboundType) -> list[str]:
         return []

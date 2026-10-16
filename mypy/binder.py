@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import DefaultDict, Iterator, List, Optional, Tuple, Union, cast
-from typing_extensions import TypeAlias as _TypeAlias
+from typing import Final, Literal, TypeAlias as _TypeAlias
 
 from mypy.erasetype import remove_instance_last_known_values
-from mypy.join import join_simple
-from mypy.literals import Key, literal, literal_hash, subkeys
-from mypy.nodes import Expression, IndexExpr, MemberExpr, NameExpr, RefExpr, TypeInfo, Var
+from mypy.literals import Key, extract_var_from_literal_hash, literal, literal_hash, subkeys
+from mypy.nodes import (
+    LITERAL_NO,
+    Expression,
+    IndexExpr,
+    MemberExpr,
+    NameExpr,
+    RefExpr,
+    TypeInfo,
+    Var,
+)
+from mypy.options import Options
 from mypy.subtypes import is_same_type, is_subtype
+from mypy.typeops import make_simplified_union
 from mypy.types import (
+    IMPRECISE_ANYS,
     AnyType,
     Instance,
     NoneType,
@@ -20,31 +31,50 @@ from mypy.types import (
     Type,
     TypeOfAny,
     TypeType,
+    TypeVarType,
     UnionType,
     UnpackType,
     find_unpack_in_list,
+    flatten_nested_unions,
     get_proper_type,
 )
 from mypy.typevars import fill_typevars_with_any
 
-BindableExpression: _TypeAlias = Union[IndexExpr, MemberExpr, NameExpr]
+BindableExpression: _TypeAlias = IndexExpr | MemberExpr | NameExpr
+
+
+class CurrentType:
+    def __init__(self, type: Type, from_assignment: bool) -> None:
+        self.type: Final = type
+        self.from_assignment: Final = from_assignment
 
 
 class Frame:
     """A Frame represents a specific point in the execution of a program.
+
     It carries information about the current types of expressions at
     that point, arising either from assignments to those expressions
-    or the result of isinstance checks. It also records whether it is
-    possible to reach that point at all.
+    or the result of isinstance checks and other type narrowing
+    operations. It also records whether it is possible to reach that
+    point at all.
+
+    We add a new frame whenever there is a new scope or control flow
+    branching.
 
     This information is not copied into a new Frame when it is pushed
     onto the stack, so a given Frame only has information about types
     that were assigned in that frame.
+
+    Expressions are stored in dicts using 'literal hashes' as keys (type
+    "Key"). These are hashable values derived from expression AST nodes
+    (only those that can be narrowed). literal_hash(expr) is used to
+    calculate the hashes. Note that this isn't directly related to literal
+    types -- the concept predates literal types.
     """
 
     def __init__(self, id: int, conditional_frame: bool = False) -> None:
         self.id = id
-        self.types: dict[Key, Type] = {}
+        self.types: dict[Key, CurrentType] = {}
         self.unreachable = False
         self.conditional_frame = conditional_frame
         self.suppress_unreachable_warnings = False
@@ -53,35 +83,90 @@ class Frame:
         return f"Frame({self.id}, {self.types}, {self.unreachable}, {self.conditional_frame})"
 
 
-Assigns = DefaultDict[Expression, List[Tuple[Type, Optional[Type]]]]
+Assigns = defaultdict[Expression, list[tuple[Type, Type | None]]]
+
+
+class FrameContext:
+    """Context manager pushing a Frame to ConditionalTypeBinder.
+
+    See frame_context() below for documentation on parameters. We use this class
+    instead of @contextmanager as a mypyc-specific performance optimization.
+    """
+
+    def __init__(
+        self,
+        binder: ConditionalTypeBinder,
+        can_skip: bool,
+        fall_through: int,
+        break_frame: int,
+        continue_frame: int,
+        conditional_frame: bool,
+        try_frame: bool,
+        discard: bool,
+    ) -> None:
+        self.binder = binder
+        self.can_skip = can_skip
+        self.fall_through = fall_through
+        self.break_frame = break_frame
+        self.continue_frame = continue_frame
+        self.conditional_frame = conditional_frame
+        self.try_frame = try_frame
+        self.discard = discard
+
+    def __enter__(self) -> Frame:
+        assert len(self.binder.frames) > 1
+
+        if self.break_frame:
+            self.binder.break_frames.append(len(self.binder.frames) - self.break_frame)
+        if self.continue_frame:
+            self.binder.continue_frames.append(len(self.binder.frames) - self.continue_frame)
+        if self.try_frame:
+            self.binder.try_frames.add(len(self.binder.frames) - 1)
+
+        new_frame = self.binder.push_frame(self.conditional_frame)
+        if self.try_frame:
+            # An exception may occur immediately
+            self.binder.allow_jump(-1)
+        return new_frame
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> Literal[False]:
+        self.binder.pop_frame(self.can_skip, self.fall_through, discard=self.discard)
+
+        if self.break_frame:
+            self.binder.break_frames.pop()
+        if self.continue_frame:
+            self.binder.continue_frames.pop()
+        if self.try_frame:
+            self.binder.try_frames.remove(len(self.binder.frames) - 1)
+        return False
 
 
 class ConditionalTypeBinder:
     """Keep track of conditional types of variables.
 
-    NB: Variables are tracked by literal expression, so it is possible
-    to confuse the binder; for example,
+    NB: Variables are tracked by literal hashes of expressions, so it is
+    possible to confuse the binder when there is aliasing. Example:
 
-    ```
-    class A:
-        a: Union[int, str] = None
-    x = A()
-    lst = [x]
-    reveal_type(x.a)      # Union[int, str]
-    x.a = 1
-    reveal_type(x.a)      # int
-    reveal_type(lst[0].a) # Union[int, str]
-    lst[0].a = 'a'
-    reveal_type(x.a)      # int
-    reveal_type(lst[0].a) # str
-    ```
+        class A:
+            a: int | str
+
+        x = A()
+        lst = [x]
+        reveal_type(x.a)      # int | str
+        x.a = 1
+        reveal_type(x.a)      # int
+        reveal_type(lst[0].a) # int | str
+        lst[0].a = 'a'
+        reveal_type(x.a)      # int
+        reveal_type(lst[0].a) # str
     """
 
     # Stored assignments for situations with tuple/list lvalue and rvalue of union type.
     # This maps an expression to a list of bound types for every item in the union type.
     type_assignments: Assigns | None = None
 
-    def __init__(self) -> None:
+    def __init__(self, options: Options) -> None:
+        # Each frame gets an increasing, distinct id.
         self.next_id = 1
 
         # The stack of frames currently used.  These map
@@ -109,9 +194,19 @@ class ConditionalTypeBinder:
         # Whether the last pop changed the newly top frame on exit
         self.last_pop_changed = False
 
+        # These are used to track control flow in try statements and loops.
         self.try_frames: set[int] = set()
         self.break_frames: list[int] = []
         self.continue_frames: list[int] = []
+
+        # If True, initial assignment to a simple variable (e.g. "x", but not "x.y")
+        # is added to the binder. This allows more precise narrowing and more
+        # flexible inference of variable types (--allow-redefinition).
+        self.bind_all = options.allow_redefinition
+
+        # This tracks any externally visible changes in binder to invalidate
+        # expression caches when needed.
+        self.version = 0
 
     def _get_id(self) -> int:
         self.next_id += 1
@@ -132,10 +227,11 @@ class ConditionalTypeBinder:
         self.options_on_return.append([])
         return f
 
-    def _put(self, key: Key, type: Type, index: int = -1) -> None:
-        self.frames[index].types[key] = type
+    def _put(self, key: Key, type: Type, from_assignment: bool, index: int = -1) -> None:
+        self.version += 1
+        self.frames[index].types[key] = CurrentType(type, from_assignment)
 
-    def _get(self, key: Key, index: int = -1) -> Type | None:
+    def _get(self, key: Key, index: int = -1) -> CurrentType | None:
         if index < 0:
             index += len(self.frames)
         for i in range(index, -1, -1):
@@ -143,7 +239,20 @@ class ConditionalTypeBinder:
                 return self.frames[i].types[key]
         return None
 
-    def put(self, expr: Expression, typ: Type) -> None:
+    @classmethod
+    def can_put_directly(cls, expr: Expression) -> bool:
+        """Will `.put()` on this expression be successful?
+
+        This is inlined in `.put()` because the logic is rather hot and must be kept
+        in sync.
+        """
+        return isinstance(expr, (IndexExpr, MemberExpr, NameExpr)) and literal(expr) > LITERAL_NO
+
+    def put(self, expr: Expression, typ: Type, *, from_assignment: bool = True) -> None:
+        """Directly set the narrowed type of expression (if it supports it).
+
+        This is used for isinstance() etc. Assignments should go through assign_type().
+        """
         if not isinstance(expr, (IndexExpr, MemberExpr, NameExpr)):
             return
         if not literal(expr):
@@ -153,9 +262,10 @@ class ConditionalTypeBinder:
         if key not in self.declarations:
             self.declarations[key] = get_declaration(expr)
             self._add_dependencies(key)
-        self._put(key, typ)
+        self._put(key, typ, from_assignment)
 
     def unreachable(self) -> None:
+        self.version += 1
         self.frames[-1].unreachable = True
 
     def suppress_unreachable_warnings(self) -> None:
@@ -164,7 +274,10 @@ class ConditionalTypeBinder:
     def get(self, expr: Expression) -> Type | None:
         key = literal_hash(expr)
         assert key is not None, "Internal error: binder tried to get non-literal"
-        return self._get(key)
+        found = self._get(key)
+        if found is None:
+            return None
+        return found.type
 
     def is_unreachable(self) -> bool:
         # TODO: Copy the value of unreachable into new frames to avoid
@@ -193,31 +306,73 @@ class ConditionalTypeBinder:
         If a key is declared as AnyType, only update it if all the
         options are the same.
         """
-
-        frames = [f for f in frames if not f.unreachable]
+        all_reachable = all(not f.unreachable for f in frames)
+        if not all_reachable:
+            frames = [f for f in frames if not f.unreachable]
         changed = False
-        keys = {key for f in frames for key in f.types}
-
+        keys = [key for f in frames for key in f.types]
+        if len(keys) > 1:
+            keys = list(set(keys))
         for key in keys:
             current_value = self._get(key)
             resulting_values = [f.types.get(key, current_value) for f in frames]
-            if any(x is None for x in resulting_values):
+            # Keys can be narrowed using two different semantics. The new semantics
+            # is enabled for inferred variables when bind_all is true, and it allows
+            # variable types to be widened using subsequent assignments. This is
+            # not allowed for instance attributes and annotated variables.
+            var = extract_var_from_literal_hash(key)
+            old_semantics = (
+                not self.bind_all or var is None or not var.is_inferred and not var.is_argument
+            )
+            if old_semantics and any(x is None for x in resulting_values):
                 # We didn't know anything about key before
                 # (current_value must be None), and we still don't
                 # know anything about key in at least one possible frame.
                 continue
 
-            type = resulting_values[0]
-            assert type is not None
+            resulting_values = [x for x in resulting_values if x is not None]
+
+            if all_reachable and all(not x.from_assignment for x in resulting_values):
+                # Do not synthesize a new type if we encountered a conditional block
+                # (if, while or match-case) without assignments.
+                # See check-isinstance.test::testNoneCheckDoesNotMakeTypeVarOptional
+                # This is a safe assumption: the fact that we checked something with `is`
+                # or `isinstance` does not change the type of the value.
+                continue
+
+            # Remove exact duplicates to save pointless work later, this is
+            # a micro-optimization for --allow-redefinition.
+            seen_types = set()
+            resulting_types = []
+            for rv in resulting_values:
+                assert rv is not None
+                if rv.type in seen_types:
+                    continue
+                resulting_types.append(rv.type)
+                seen_types.add(rv.type)
+
+            type = resulting_types[0]
             declaration_type = get_proper_type(self.declarations.get(key))
             if isinstance(declaration_type, AnyType):
                 # At this point resulting values can't contain None, see continue above
-                if not all(is_same_type(type, cast(Type, t)) for t in resulting_values[1:]):
+                if not all(is_same_type(type, t) for t in resulting_types[1:]):
                     type = AnyType(TypeOfAny.from_another_any, source_any=declaration_type)
             else:
-                for other in resulting_values[1:]:
-                    assert other is not None
-                    type = join_simple(self.declarations[key], type, other)
+                possible_types = []
+                for t in resulting_types:
+                    assert t is not None
+                    possible_types.append(t)
+                if len(possible_types) == 1:
+                    # This is to avoid calling get_proper_type() unless needed, as this may
+                    # interfere with our (hacky) TypeGuard support.
+                    type = possible_types[0]
+                else:
+                    type = make_simplified_union(possible_types)
+                    # Legacy guard for corner case when the original type is TypeVarType.
+                    if isinstance(declaration_type, TypeVarType) and not is_subtype(
+                        type, declaration_type
+                    ):
+                        type = declaration_type
                     # Try simplifying resulting type for unions involving variadic tuples.
                     # Technically, everything is still valid without this step, but if we do
                     # not do this, this may create long unions after exiting an if check like:
@@ -228,7 +383,11 @@ class ConditionalTypeBinder:
                     # still equivalent to such type).
                     if isinstance(type, UnionType):
                         type = collapse_variadic_union(type)
-                    if isinstance(type, ProperType) and isinstance(type, UnionType):
+                    if (
+                        old_semantics
+                        and isinstance(type, ProperType)
+                        and isinstance(type, UnionType)
+                    ):
                         # Simplify away any extra Any's that were added to the declared
                         # type when popping a frame.
                         simplified = UnionType.make_union(
@@ -236,18 +395,40 @@ class ConditionalTypeBinder:
                         )
                         if simplified == self.declarations[key]:
                             type = simplified
-            if current_value is None or not is_same_type(type, current_value):
-                self._put(key, type)
-                changed = True
+            if (
+                current_value is None
+                or not is_same_type(type, current_value.type)
+                # Manually carry over any narrowing from hasattr() from inner frames. This is
+                # a bit ad-hoc, but our handling of hasattr() is on best effort basis anyway.
+                or isinstance(p_type := get_proper_type(type), Instance)
+                and p_type.extra_attrs
+            ):
+                self._put(key, type, from_assignment=True)
+                if current_value is not None or extract_var_from_literal_hash(key) is None:
+                    # We definitely learned something new
+                    changed = True
+                elif not changed:
+                    # If there is no current value compare with the declaration. This prevents
+                    # reporting false changes in cases like this:
+                    #     x: int
+                    #     if foo():
+                    #         x = 1
+                    #     else:
+                    #         x = 2
+                    # We check partial types and widening in accept_loop() separately, so
+                    # this should be safe.
+                    changed = declaration_type is not None and not is_same_type(
+                        type, declaration_type
+                    )
 
         self.frames[-1].unreachable = not frames
 
         return changed
 
-    def pop_frame(self, can_skip: bool, fall_through: int) -> Frame:
+    def pop_frame(self, can_skip: bool, fall_through: int, *, discard: bool = False) -> Frame:
         """Pop a frame and return it.
 
-        See frame_context() for documentation of fall_through.
+        See frame_context() for documentation of fall_through and discard.
         """
 
         if fall_through > 0:
@@ -255,6 +436,10 @@ class ConditionalTypeBinder:
 
         result = self.frames.pop()
         options = self.options_on_return.pop()
+
+        if discard:
+            self.last_pop_changed = False
+            return result
 
         if can_skip:
             options.insert(0, self.frames[-1])
@@ -278,9 +463,14 @@ class ConditionalTypeBinder:
         yield self.type_assignments
         self.type_assignments = old_assignments
 
-    def assign_type(
-        self, expr: Expression, type: Type, declared_type: Type | None, restrict_any: bool = False
-    ) -> None:
+    def assign_type(self, expr: Expression, type: Type, declared_type: Type | None) -> None:
+        """Narrow type of expression through an assignment.
+
+        Do nothing if the expression doesn't support narrowing.
+
+        When not narrowing though an assignment (isinstance() etc.), use put()
+        directly. This omits some special-casing logic for assignments.
+        """
         # We should erase last known value in binder, because if we are using it,
         # it means that the target is not final, and therefore can't hold a literal.
         type = remove_instance_last_known_values(type)
@@ -310,42 +500,39 @@ class ConditionalTypeBinder:
             return
 
         p_declared = get_proper_type(declared_type)
-        p_type = get_proper_type(type)
-        enclosing_type = get_proper_type(self.most_recent_enclosing_type(expr, type))
-        if isinstance(enclosing_type, AnyType) and not restrict_any:
-            # If x is Any and y is int, after x = y we do not infer that x is int.
-            # This could be changed.
-            # Instead, since we narrowed type from Any in a recent frame (probably an
-            # isinstance check), but now it is reassigned, we broaden back
-            # to Any (which is the most recent enclosing type)
-            self.put(expr, enclosing_type)
-        # As a special case, when assigning Any to a variable with a
-        # declared Optional type that has been narrowed to None,
-        # replace all the Nones in the declared Union type with Any.
-        # This overrides the normal behavior of ignoring Any assignments to variables
-        # in order to prevent false positives.
-        # (See discussion in #3526)
-        elif (
-            isinstance(p_type, AnyType)
-            and isinstance(p_declared, UnionType)
-            and any(isinstance(get_proper_type(item), NoneType) for item in p_declared.items)
-            and isinstance(
-                get_proper_type(self.most_recent_enclosing_type(expr, NoneType())), NoneType
-            )
-        ):
-            # Replace any Nones in the union type with Any
-            new_items = [
-                type if isinstance(get_proper_type(item), NoneType) else item
-                for item in p_declared.items
-            ]
-            self.put(expr, UnionType(new_items))
-        elif isinstance(p_type, AnyType) and not (
-            isinstance(p_declared, UnionType)
-            and any(isinstance(get_proper_type(item), AnyType) for item in p_declared.items)
-        ):
-            # Assigning an Any value doesn't affect the type to avoid false negatives, unless
-            # there is an Any item in a declared union type.
-            self.put(expr, declared_type)
+        if is_imprecise_any(type):
+            # Any type requires some special casing, for both historical reasons,
+            # and to optimise user experience without sacrificing correctness too much.
+            if isinstance(expr, RefExpr) and isinstance(expr.node, Var) and expr.node.is_inferred:
+                # First case: a local/global variable without explicit annotation,
+                # in this case we just assign Any (essentially following the SSA logic).
+                self.put(expr, type)
+            elif isinstance(p_declared, UnionType):
+                all_items = flatten_nested_unions(p_declared.items)
+                if any(isinstance(get_proper_type(item), NoneType) for item in all_items):
+                    # Second case: explicit optional type, in this case we optimize for
+                    # a common pattern when an untyped value used as a fallback replacing None.
+                    new_items = [
+                        type if isinstance(get_proper_type(item), NoneType) else item
+                        for item in all_items
+                    ]
+                    self.put(expr, UnionType(new_items))
+                elif any(isinstance(get_proper_type(item), AnyType) for item in all_items):
+                    # Third case: a union already containing Any (most likely from
+                    # an un-imported name), in this case we allow assigning Any as well.
+                    self.put(expr, type)
+                else:
+                    # In all other cases we don't narrow to Any to minimize false negatives.
+                    self.put(expr, declared_type)
+            else:
+                self.put(expr, declared_type)
+        elif isinstance(p_declared, AnyType):
+            # Mirroring the first case above, we don't narrow to a precise type if the variable
+            # has an explicit `Any` type annotation.
+            if isinstance(expr, RefExpr) and isinstance(expr.node, Var) and expr.node.is_inferred:
+                self.put(expr, type)
+            else:
+                self.put(expr, declared_type)
         else:
             self.put(expr, type)
 
@@ -367,17 +554,6 @@ class ConditionalTypeBinder:
         for dep in self.dependencies.get(key, set()):
             self._cleanse_key(dep)
 
-    def most_recent_enclosing_type(self, expr: BindableExpression, type: Type) -> Type | None:
-        type = get_proper_type(type)
-        if isinstance(type, AnyType):
-            return get_declaration(expr)
-        key = literal_hash(expr)
-        assert key is not None
-        enclosers = [get_declaration(expr)] + [
-            f.types[key] for f in self.frames if key in f.types and is_subtype(type, f.types[key])
-        ]
-        return enclosers[-1]
-
     def allow_jump(self, index: int) -> None:
         # self.frames and self.options_on_return have different lengths
         # so make sure the index is positive
@@ -398,7 +574,6 @@ class ConditionalTypeBinder:
         self.allow_jump(self.continue_frames[-1])
         self.unreachable()
 
-    @contextmanager
     def frame_context(
         self,
         *,
@@ -408,7 +583,8 @@ class ConditionalTypeBinder:
         continue_frame: int = 0,
         conditional_frame: bool = False,
         try_frame: bool = False,
-    ) -> Iterator[Frame]:
+        discard: bool = False,
+    ) -> FrameContext:
         """Return a context manager that pushes/pops frames on enter/exit.
 
         If can_skip is True, control flow is allowed to bypass the
@@ -416,12 +592,12 @@ class ConditionalTypeBinder:
 
         If fall_through > 0, then it will allow control flow that
         falls off the end of the frame to escape to its ancestor
-        `fall_through` levels higher. Otherwise control flow ends
+        `fall_through` levels higher. Otherwise, control flow ends
         at the end of the frame.
 
         If break_frame > 0, then 'break' statements within this frame
         will jump out to the frame break_frame levels higher than the
-        frame created by this call to frame_context. Similarly for
+        frame created by this call to frame_context. Similarly, for
         continue_frame and 'continue' statements.
 
         If try_frame is true, then execution is allowed to jump at any
@@ -429,32 +605,23 @@ class ConditionalTypeBinder:
         its parent (i.e., to the frame that was on top before this
         call to frame_context).
 
+        If discard is True, then this is a temporary throw-away frame
+        (used e.g. for isolation) and its effect will be discarded on pop.
+
         After the context manager exits, self.last_pop_changed indicates
         whether any types changed in the newly-topmost frame as a result
         of popping this frame.
         """
-        assert len(self.frames) > 1
-
-        if break_frame:
-            self.break_frames.append(len(self.frames) - break_frame)
-        if continue_frame:
-            self.continue_frames.append(len(self.frames) - continue_frame)
-        if try_frame:
-            self.try_frames.add(len(self.frames) - 1)
-
-        new_frame = self.push_frame(conditional_frame)
-        if try_frame:
-            # An exception may occur immediately
-            self.allow_jump(-1)
-        yield new_frame
-        self.pop_frame(can_skip, fall_through)
-
-        if break_frame:
-            self.break_frames.pop()
-        if continue_frame:
-            self.continue_frames.pop()
-        if try_frame:
-            self.try_frames.remove(len(self.frames) - 1)
+        return FrameContext(
+            self,
+            can_skip=can_skip,
+            fall_through=fall_through,
+            break_frame=break_frame,
+            continue_frame=continue_frame,
+            conditional_frame=conditional_frame,
+            try_frame=try_frame,
+            discard=discard,
+        )
 
     @contextmanager
     def top_frame_context(self) -> Iterator[Frame]:
@@ -468,10 +635,15 @@ class ConditionalTypeBinder:
 
 
 def get_declaration(expr: BindableExpression) -> Type | None:
+    """Get the declared or inferred type of a RefExpr expression.
+
+    Return None if there is no type or the expression is not a RefExpr.
+    This can return None if the type hasn't been inferred yet.
+    """
     if isinstance(expr, RefExpr):
         if isinstance(expr.node, Var):
             type = expr.node.type
-            if not isinstance(get_proper_type(type), PartialType):
+            if not isinstance(type, PartialType):
                 return type
         elif isinstance(expr.node, TypeInfo):
             return TypeType(fill_typevars_with_any(expr.node))
@@ -536,3 +708,14 @@ def collapse_variadic_union(typ: UnionType) -> Type:
     else:
         simplified = TupleType(prefix + [unpack] + suffix, fallback=last.partial_fallback)
     return UnionType.make_union([simplified] + other_items)
+
+
+def is_imprecise_any(tp: Type) -> bool:
+    """Is this an imprecise Any type?"""
+    tp = get_proper_type(tp)
+    if not isinstance(tp, AnyType):
+        return False
+    if tp.type_of_any == TypeOfAny.from_another_any:
+        assert tp.source_any is not None
+        tp = tp.source_any
+    return tp.type_of_any in IMPRECISE_ANYS

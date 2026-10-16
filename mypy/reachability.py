@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Final, Tuple, TypeVar
+from typing import Final, TypeVar
 
 from mypy.literals import literal
 from mypy.nodes import (
@@ -19,10 +19,12 @@ from mypy.nodes import (
     ImportFrom,
     IndexExpr,
     IntExpr,
+    ListExpr,
     MatchStmt,
     MemberExpr,
     NameExpr,
     OpExpr,
+    SetExpr,
     SliceExpr,
     StrExpr,
     TupleExpr,
@@ -91,10 +93,7 @@ def infer_reachability_of_match_statement(s: MatchStmt, options: Options) -> Non
         ):
             # The case is considered always false, so we skip the case body.
             mark_block_unreachable(s.bodies[i])
-        elif pattern_value in (ALWAYS_FALSE, MYPY_TRUE) and guard_value in (
-            ALWAYS_TRUE,
-            MYPY_TRUE,
-        ):
+        elif pattern_value in (ALWAYS_TRUE, MYPY_TRUE) and guard_value in (ALWAYS_TRUE, MYPY_TRUE):
             for body in s.bodies[i + 1 :]:
                 mark_block_unreachable(body)
 
@@ -115,31 +114,44 @@ def infer_condition_value(expr: Expression, options: Options) -> int:
     MYPY_TRUE if true under mypy and false at runtime, MYPY_FALSE if
     false under mypy and true at runtime, else TRUTH_VALUE_UNKNOWN.
     """
+    if isinstance(expr, UnaryExpr) and expr.op == "not":
+        positive = infer_condition_value(expr.expr, options)
+        return inverted_truth_mapping[positive]
+
     pyversion = options.python_version
     name = ""
-    negated = False
-    alias = expr
-    if isinstance(alias, UnaryExpr):
-        if alias.op == "not":
-            expr = alias.expr
-            negated = True
+
     result = TRUTH_VALUE_UNKNOWN
     if isinstance(expr, NameExpr):
         name = expr.name
     elif isinstance(expr, MemberExpr):
         name = expr.name
-    elif isinstance(expr, OpExpr) and expr.op in ("and", "or"):
+    elif isinstance(expr, OpExpr):
+        if expr.op not in ("or", "and"):
+            return TRUTH_VALUE_UNKNOWN
+
         left = infer_condition_value(expr.left, options)
-        if (left in (ALWAYS_TRUE, MYPY_TRUE) and expr.op == "and") or (
-            left in (ALWAYS_FALSE, MYPY_FALSE) and expr.op == "or"
-        ):
-            # Either `True and <other>` or `False or <other>`: the result will
-            # always be the right-hand-side.
-            return infer_condition_value(expr.right, options)
-        else:
-            # The result will always be the left-hand-side (e.g. ALWAYS_* or
-            # TRUTH_VALUE_UNKNOWN).
-            return left
+        right = infer_condition_value(expr.right, options)
+        results = {left, right}
+        if expr.op == "or":
+            if ALWAYS_TRUE in results:
+                return ALWAYS_TRUE
+            elif MYPY_TRUE in results:
+                return MYPY_TRUE
+            elif left == right == MYPY_FALSE:
+                return MYPY_FALSE
+            elif results <= {ALWAYS_FALSE, MYPY_FALSE}:
+                return ALWAYS_FALSE
+        elif expr.op == "and":
+            if ALWAYS_FALSE in results:
+                return ALWAYS_FALSE
+            elif MYPY_FALSE in results:
+                return MYPY_FALSE
+            elif left == right == ALWAYS_TRUE:
+                return ALWAYS_TRUE
+            elif results <= {ALWAYS_TRUE, MYPY_TRUE}:
+                return MYPY_TRUE
+        return TRUTH_VALUE_UNKNOWN
     else:
         result = consider_sys_version_info(expr, pyversion)
         if result == TRUTH_VALUE_UNKNOWN:
@@ -155,8 +167,6 @@ def infer_condition_value(expr: Expression, options: Options) -> int:
             result = ALWAYS_TRUE
         elif name in options.always_false:
             result = ALWAYS_FALSE
-    if negated:
-        result = inverted_truth_mapping[result]
     return result
 
 
@@ -221,22 +231,30 @@ def consider_sys_platform(expr: Expression, platform: str) -> int:
     Return ALWAYS_TRUE, ALWAYS_FALSE, or TRUTH_VALUE_UNKNOWN.
     """
     # Cases supported:
-    # - sys.platform == 'posix'
+    # - sys.platform == 'linux'
     # - sys.platform != 'win32'
     # - sys.platform.startswith('win')
+    # - sys.platform in {'linux', 'darwin'}
+    # - sys.platform not in ('win32', 'cygwin')
     if isinstance(expr, ComparisonExpr):
         # Let's not yet support chained comparisons.
         if len(expr.operators) > 1:
             return TRUTH_VALUE_UNKNOWN
         op = expr.operators[0]
-        if op not in ("==", "!="):
-            return TRUTH_VALUE_UNKNOWN
         if not is_sys_attr(expr.operands[0], "platform"):
             return TRUTH_VALUE_UNKNOWN
         right = expr.operands[1]
-        if not isinstance(right, StrExpr):
+        if op in ("==", "!=") and isinstance(right, StrExpr):
+            return fixed_comparison(platform, op, right.value)
+        if op not in ("in", "not in"):
             return TRUTH_VALUE_UNKNOWN
-        return fixed_comparison(platform, op, right.value)
+        items = contains_tuple_or_set_of_strings(right)
+        if items is None:
+            return TRUTH_VALUE_UNKNOWN
+        result = platform in items
+        if op == "not in":
+            result = not result
+        return ALWAYS_TRUE if result else ALWAYS_FALSE
     elif isinstance(expr, CallExpr):
         if not isinstance(expr.callee, MemberExpr):
             return TRUTH_VALUE_UNKNOWN
@@ -254,7 +272,7 @@ def consider_sys_platform(expr: Expression, platform: str) -> int:
         return TRUTH_VALUE_UNKNOWN
 
 
-Targ = TypeVar("Targ", int, str, Tuple[int, ...])
+Targ = TypeVar("Targ", int, str, tuple[int, ...])
 
 
 def fixed_comparison(left: Targ, op: str, right: Targ) -> int:
@@ -285,6 +303,14 @@ def contains_int_or_tuple_of_ints(expr: Expression) -> None | int | tuple[int, .
                     return None
                 thing.append(x.value)
             return tuple(thing)
+    return None
+
+
+def contains_tuple_or_set_of_strings(expr: Expression) -> tuple[str, ...] | None:
+    if isinstance(expr, (TupleExpr, SetExpr, ListExpr)) and all(
+        isinstance(item, StrExpr) for item in expr.items
+    ):
+        return tuple(item.value for item in expr.items if isinstance(item, StrExpr))
     return None
 
 

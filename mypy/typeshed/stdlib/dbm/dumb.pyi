@@ -1,6 +1,9 @@
+import sys
+from _typeshed import StrOrBytesPath
 from collections.abc import Iterator, MutableMapping
 from types import TracebackType
-from typing_extensions import Self, TypeAlias
+from typing import TypeAlias
+from typing_extensions import Self
 
 __all__ = ["error", "open"]
 
@@ -15,6 +18,9 @@ error = OSError
 class _Database(MutableMapping[_KeyType, bytes]):
     def __init__(self, filebasename: str, mode: str, flag: str = "c") -> None: ...
     def sync(self) -> None: ...
+    if sys.version_info >= (3, 15):
+        def reorganize(self) -> None: ...
+
     def iterkeys(self) -> Iterator[bytes]: ...  # undocumented
     def close(self) -> None: ...
     def __getitem__(self, key: _KeyType) -> bytes: ...
@@ -28,4 +34,8 @@ class _Database(MutableMapping[_KeyType, bytes]):
         self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
     ) -> None: ...
 
-def open(file: str, flag: str = "c", mode: int = 0o666) -> _Database: ...
+if sys.version_info >= (3, 11):
+    def open(file: StrOrBytesPath, flag: str = "c", mode: int = 0o666) -> _Database: ...
+
+else:
+    def open(file: str, flag: str = "c", mode: int = 0o666) -> _Database: ...

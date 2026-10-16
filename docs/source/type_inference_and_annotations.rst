@@ -41,12 +41,10 @@ variable type annotation:
 
 .. code-block:: python
 
-   from typing import Union
-
-   x: Union[int, str] = 1
+   x: int | str = 1
 
 Without the type annotation, the type of ``x`` would be just ``int``. We
-use an annotation to give it a more general type ``Union[int, str]`` (this
+use an annotation to give it a more general type ``int | str`` (this
 type means that the value can be either an ``int`` or a ``str``).
 
 The best way to think about this is that the type annotation sets the type of
@@ -55,8 +53,8 @@ about the following code:
 
 .. code-block:: python
 
-   x: Union[int, str] = 1.1  # error: Incompatible types in assignment
-                             # (expression has type "float", variable has type "Union[int, str]")
+   x: int | str = 1.1  # error: Incompatible types in assignment
+                       # (expression has type "float", variable has type "int | str")
 
 .. note::
 
@@ -95,14 +93,6 @@ In these cases you can give the type explicitly using a type annotation:
 
    l: list[int] = []       # Create empty list of int
    d: dict[str, int] = {}  # Create empty dictionary (str -> int)
-
-.. note::
-
-   Using type arguments (e.g. ``list[int]``) on builtin collections like
-   :py:class:`list`,  :py:class:`dict`, :py:class:`tuple`, and  :py:class:`set`
-   only works in Python 3.9 and later. For Python 3.8 and earlier, you must use
-   :py:class:`~typing.List` (e.g. ``List[int]``), :py:class:`~typing.Dict`, and
-   so on.
 
 
 Compatibility of container types
@@ -161,7 +151,7 @@ on the declared type of ``arg`` in ``foo``:
 .. code-block:: python
 
     def foo(arg: list[int]) -> None:
-        print('Items:', ''.join(str(a) for a in arg))
+        print('Items:', ', '.join(str(a) for a in arg))
 
     foo([])  # OK
 
@@ -172,7 +162,7 @@ in the following statement:
 .. code-block:: python
 
     def foo(arg: list[int]) -> None:
-        print('Items:', ', '.join(arg))
+        print('Items:', ', '.join(str(a) for a in arg))
 
     a = []  # Error: Need type annotation for "a"
     foo(a)

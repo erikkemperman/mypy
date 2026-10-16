@@ -3,9 +3,10 @@
 from contextlib import contextmanager
 from collections.abc import Iterator
 import math
+import sys
 from typing import (
     Any, Iterator, TypeVar, Generator, Optional, List, Tuple, Sequence,
-    Union, Callable, Awaitable,
+    Union, Callable, Awaitable, Generic
 )
 from typing import Final
 
@@ -44,8 +45,8 @@ float_vals = [
 def assertRaises(typ: type, msg: str = '') -> Iterator[None]:
     try:
         yield
-    except Exception as e:
-        assert isinstance(e, typ), f"{e!r} is not a {typ.__name__}"
+    except BaseException as e:
+        assert type(e) is typ, f"{e!r} is not a {typ.__name__}"
         assert msg in str(e), f'Message "{e}" does not match "{msg}"'
     else:
         assert False, f"Expected {typ.__name__} but got no exception"
@@ -85,8 +86,42 @@ def run_generator(gen: Generator[T, V, U],
 
 F = TypeVar('F', bound=Callable)
 
+# Result codes of CPython's C-level send protocol (PySendResult).
+PYGEN_RETURN: Final = 0
+PYGEN_ERROR: Final = -1
+PYGEN_NEXT: Final = 1
 
-class async_val(Awaitable[V]):
+
+def pyiter_send(it: Any, arg: Any) -> Tuple[int, Any]:
+    """Resume an iterator through CPython's C-level PyIter_Send protocol.
+
+    PyIter_Send calls the iterator type's am_send slot when available. asyncio's C Task,
+    mypyc's generic 'await' and 'yield from' paths, and Python 3.11's SEND opcode use this
+    protocol. On Python 3.12 and later, SEND bypasses PyIter_Send: it has an inline fast
+    path for exact CPython generators and coroutines, and otherwise calls tp_iternext
+    when sending None and the send method for other values. mypyc's native fast path
+    calls the generator helper directly.
+
+    Return (code, value), where code is PYGEN_NEXT for a yielded value and PYGEN_RETURN
+    for normal completion. Completion does not raise StopIteration. Other exceptions
+    propagate because ctypes re-raises the exception left pending by PyIter_Send.
+    """
+    import ctypes
+
+    send = ctypes.pythonapi.PyIter_Send
+    send.argtypes = [ctypes.py_object, ctypes.py_object, ctypes.POINTER(ctypes.py_object)]
+    send.restype = ctypes.c_int
+    result = ctypes.py_object()
+    code = send(it, arg, ctypes.byref(result))
+    assert code in (PYGEN_NEXT, PYGEN_RETURN), f"unexpected PySendResult {code}"
+    try:
+        value = result.value
+    except ValueError:
+        assert False, f"PyIter_Send returned {code} but left *result NULL"
+    return code, value
+
+
+class async_val(Awaitable[V], Generic[T, V]):
     def __init__(self, val: T) -> None:
         self.val = val
 
@@ -101,3 +136,11 @@ def make_python_function(f: F) -> F:
     def g(*args: Any, **kwargs: Any) -> Any:
         return f(*args, **kwargs)
     return g  # type: ignore
+
+
+def is_gil_disabled() -> bool:
+    return hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled()
+
+
+def is_64_bit_platform() -> bool:
+    return getattr(sys, "maxsize") > 2**32

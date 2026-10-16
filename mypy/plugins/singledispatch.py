@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from typing import Final, NamedTuple, Sequence, TypeVar, Union
-from typing_extensions import TypeAlias as _TypeAlias
+from collections.abc import Sequence
+from typing import NamedTuple, TypeAlias as _TypeAlias, TypeVar
 
 from mypy.messages import format_type
 from mypy.nodes import ARG_POS, Argument, Block, ClassDef, Context, SymbolTable, TypeInfo, Var
 from mypy.options import Options
 from mypy.plugin import CheckerPluginInterface, FunctionContext, MethodContext, MethodSigContext
 from mypy.plugins.common import add_method_to_class
+from mypy.plugins.constants import SINGLEDISPATCH_REGISTER_RETURN_CLASS
 from mypy.subtypes import is_subtype
 from mypy.types import (
     AnyType,
     CallableType,
-    FunctionLike,
     Instance,
     NoneType,
     Overloaded,
@@ -32,13 +32,6 @@ class RegisterCallableInfo(NamedTuple):
     singledispatch_obj: Instance
 
 
-SINGLEDISPATCH_TYPE: Final = "functools._SingleDispatchCallable"
-
-SINGLEDISPATCH_REGISTER_METHOD: Final = f"{SINGLEDISPATCH_TYPE}.register"
-
-SINGLEDISPATCH_CALLABLE_CALL_METHOD: Final = f"{SINGLEDISPATCH_TYPE}.__call__"
-
-
 def get_singledispatch_info(typ: Instance) -> SingledispatchTypeVars | None:
     if len(typ.args) == 2:
         return SingledispatchTypeVars(*typ.args)  # type: ignore[arg-type]
@@ -55,16 +48,11 @@ def get_first_arg(args: list[list[T]]) -> T | None:
     return None
 
 
-REGISTER_RETURN_CLASS: Final = "_SingleDispatchRegisterCallable"
-
-REGISTER_CALLABLE_CALL_METHOD: Final = f"functools.{REGISTER_RETURN_CLASS}.__call__"
-
-
 def make_fake_register_class_instance(
     api: CheckerPluginInterface, type_args: Sequence[Type]
 ) -> Instance:
-    defn = ClassDef(REGISTER_RETURN_CLASS, Block([]))
-    defn.fullname = f"functools.{REGISTER_RETURN_CLASS}"
+    defn = ClassDef(SINGLEDISPATCH_REGISTER_RETURN_CLASS, Block([]))
+    defn.fullname = f"functools.{SINGLEDISPATCH_REGISTER_RETURN_CLASS}"
     info = TypeInfo(SymbolTable(), defn, "functools")
     obj_type = api.named_generic_type("builtins.object", []).type
     info.bases = [Instance(obj_type, [])]
@@ -77,7 +65,7 @@ def make_fake_register_class_instance(
     return Instance(info, type_args)
 
 
-PluginContext: _TypeAlias = Union[FunctionContext, MethodContext]
+PluginContext: _TypeAlias = FunctionContext | MethodContext
 
 
 def fail(ctx: PluginContext, msg: str, context: Context | None) -> None:
@@ -137,7 +125,7 @@ def singledispatch_register_callback(ctx: MethodContext) -> Type:
 
         # is_subtype doesn't work when the right type is Overloaded, so we need the
         # actual type
-        register_type = first_arg_type.items[0].ret_type
+        register_type = first_arg_type.items[0].get_instance_type()
         type_args = RegisterCallableInfo(register_type, ctx.type)
         register_callable = make_fake_register_class_instance(ctx.api, type_args)
         return register_callable
@@ -214,7 +202,7 @@ def call_singledispatch_function_after_register_argument(ctx: MethodContext) -> 
     return ctx.default_return_type
 
 
-def call_singledispatch_function_callback(ctx: MethodSigContext) -> FunctionLike:
+def call_singledispatch_function_callback(ctx: MethodSigContext) -> CallableType:
     """Called for functools._SingleDispatchCallable.__call__"""
     if not isinstance(ctx.type, Instance):
         return ctx.default_signature

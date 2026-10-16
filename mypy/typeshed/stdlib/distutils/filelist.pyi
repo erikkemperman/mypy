@@ -15,6 +15,7 @@ class FileList:
     def sort(self) -> None: ...
     def remove_duplicates(self) -> None: ...
     def process_template_line(self, line: str) -> None: ...
+
     @overload
     def include_pattern(
         self, pattern: str, anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: Literal[0, False] = 0
@@ -23,8 +24,13 @@ class FileList:
     def include_pattern(self, pattern: str | Pattern[str], *, is_regex: Literal[True, 1]) -> bool: ...
     @overload
     def include_pattern(
-        self, pattern: str | Pattern[str], anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: int = 0
+        self,
+        pattern: str | Pattern[str],
+        anchor: bool | Literal[0, 1] = 1,
+        prefix: str | None = None,
+        is_regex: bool | Literal[0, 1] = 0,
     ) -> bool: ...
+
     @overload
     def exclude_pattern(
         self, pattern: str, anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: Literal[0, False] = 0
@@ -33,11 +39,16 @@ class FileList:
     def exclude_pattern(self, pattern: str | Pattern[str], *, is_regex: Literal[True, 1]) -> bool: ...
     @overload
     def exclude_pattern(
-        self, pattern: str | Pattern[str], anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: int = 0
+        self,
+        pattern: str | Pattern[str],
+        anchor: bool | Literal[0, 1] = 1,
+        prefix: str | None = None,
+        is_regex: bool | Literal[0, 1] = 0,
     ) -> bool: ...
 
 def findall(dir: str = ".") -> list[str]: ...
 def glob_to_re(pattern: str) -> str: ...
+
 @overload
 def translate_pattern(
     pattern: str, anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: Literal[False, 0] = 0
@@ -46,5 +57,5 @@ def translate_pattern(
 def translate_pattern(pattern: str | Pattern[str], *, is_regex: Literal[True, 1]) -> Pattern[str]: ...
 @overload
 def translate_pattern(
-    pattern: str | Pattern[str], anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: int = 0
+    pattern: str | Pattern[str], anchor: bool | Literal[0, 1] = 1, prefix: str | None = None, is_regex: bool | Literal[0, 1] = 0
 ) -> Pattern[str]: ...

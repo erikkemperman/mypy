@@ -4,40 +4,47 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
-import pathlib
 import re
 import shutil
 import sys
 import time
+from collections.abc import Callable, Container, Iterable, Sequence, Sized
 from importlib import resources as importlib_resources
-from typing import IO, Callable, Container, Final, Iterable, Sequence, Sized, TypeVar
-from typing_extensions import Literal
+from typing import IO, Any, Final, Literal, TypeVar
+
+from mypy_extensions import i64
+
+orjson: Any
+try:
+    import orjson  # type: ignore[import-not-found, no-redef, unused-ignore]
+except ImportError:
+    orjson = None
 
 try:
-    import curses
-
     import _curses  # noqa: F401
+    import curses
 
     CURSES_ENABLED = True
 except ImportError:
     CURSES_ENABLED = False
 
+try:
+    import psutil
+
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 T = TypeVar("T")
 
-if sys.version_info >= (3, 9):
-    TYPESHED_DIR: Final = str(importlib_resources.files("mypy") / "typeshed")
-else:
-    with importlib_resources.path(
-        "mypy",  # mypy-c doesn't support __package__
-        "py.typed",  # a marker file for type information, we assume typeshed to live in the same dir
-    ) as _resource:
-        TYPESHED_DIR = str(_resource.parent / "typeshed")
-
+TYPESHED_DIR: Final = str(importlib_resources.files("mypy") / "typeshed")
 
 ENCODING_RE: Final = re.compile(rb"([ \t\v]*#.*(\r\n?|\n))??[ \t\v]*#.*coding[:=][ \t]*([-\w.]+)")
 
 DEFAULT_SOURCE_OFFSET: Final = 4
+CODE_START: Final = " " * DEFAULT_SOURCE_OFFSET
 DEFAULT_COLUMNS: Final = 80
 
 # At least this number of columns will be shown on each side of
@@ -69,7 +76,7 @@ def is_dunder(name: str, exclude_special: bool = False) -> bool:
 
 
 def is_sunder(name: str) -> bool:
-    return not is_dunder(name) and name.startswith("_") and name.endswith("_")
+    return not is_dunder(name) and name.startswith("_") and name.endswith("_") and name != "_"
 
 
 def split_module_names(mod_name: str) -> list[str]:
@@ -196,7 +203,7 @@ def trim_source_line(line: str, max_len: int, col: int, min_width: int) -> tuple
     A typical result looks like this:
         ...some_variable = function_to_call(one_arg, other_arg) or...
 
-    Return the trimmed string and the column offset to to adjust error location.
+    Return the trimmed string and the column offset to adjust error location.
     """
     if max_len < 2 * min_width + 1:
         # In case the window is too tiny it is better to still show something.
@@ -298,7 +305,7 @@ def _generate_junit_contents(
                     text=escape("\n".join(messages)),
                     filename="mypy",
                     time=dt,
-                    name="mypy-py{ver}-{platform}".format(ver=version, platform=platform),
+                    name=f"mypy-py{version}-{platform}",
                 )
 
     xml += JUNIT_FOOTER
@@ -412,9 +419,43 @@ def replace_object_state(
             pass
 
 
-def is_sub_path(path1: str, path2: str) -> bool:
-    """Given two paths, return if path1 is a sub-path of path2."""
-    return pathlib.Path(path2) in pathlib.Path(path1).parents
+def is_sub_path_normabs(path: str, dir: str) -> bool:
+    """Given two paths, return if path is a sub-path of dir.
+
+    Moral equivalent of: Path(dir) in Path(path).parents
+
+    Similar to the pathlib version:
+    - Treats paths case-sensitively
+    - Does not fully handle unnormalised paths (e.g. paths with "..")
+    - Does not handle a mix of absolute and relative paths
+    Unlike the pathlib version:
+    - Fast
+    - On Windows, assumes input has been slash normalised
+    - Handles even fewer unnormalised paths (e.g. paths with "." and "//")
+
+    As a result, callers should ensure that inputs have had os.path.abspath called on them
+    (note that os.path.abspath will normalise)
+    """
+    if not dir.endswith(os.sep):
+        dir += os.sep
+    return path.startswith(dir)
+
+
+if sys.platform == "linux" or sys.platform == "darwin":
+
+    def os_path_join(path: str, b: str) -> str:
+        # Based off of os.path.join, but simplified to str-only, 2 args and mypyc can compile it.
+        if b.startswith("/") or not path:
+            return b
+        elif path.endswith("/"):
+            return path + b
+        else:
+            return path + "/" + b
+
+else:
+
+    def os_path_join(a: str, p: str) -> str:
+        return os.path.join(a, p)
 
 
 def hard_exit(status: int = 0) -> None:
@@ -451,10 +492,10 @@ def get_unique_redefinition_name(name: str, existing: Container[str]) -> str:
 def check_python_version(program: str) -> None:
     """Report issues with the Python used to run mypy, dmypy, or stubgen"""
     # Check for known bad Python versions.
-    if sys.version_info[:2] < (3, 8):  # noqa: UP036
+    if sys.version_info[:2] < (3, 10):  # noqa: UP036, RUF100
         sys.exit(
-            "Running {name} with Python 3.7 or lower is not supported; "
-            "please upgrade to 3.8 or newer".format(name=program)
+            "Running {name} with Python 3.9 or lower is not supported; "
+            "please upgrade to 3.10 or newer".format(name=program)
         )
 
 
@@ -535,15 +576,20 @@ def hash_digest(data: bytes) -> str:
     accidental collision, but we don't really care about any of the
     cryptographic properties.
     """
-    # Once we drop Python 3.5 support, we should consider using
-    # blake2b, which is faster.
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha1(data).hexdigest()
+
+
+def hash_digest_bytes(data: bytes) -> bytes:
+    """Compute a hash digest of some data.
+
+    Similar to above but returns a bytes object.
+    """
+    return hashlib.sha1(data).digest()
 
 
 def parse_gray_color(cup: bytes) -> str:
     """Reproduce a gray color in ANSI escape sequence"""
-    if sys.platform == "win32":
-        assert False, "curses is not available on Windows"
+    assert sys.platform != "win32", "curses is not available on Windows"
     set_color = "".join([cup[:-1].decode(), "m"])
     gray = curses.tparm(set_color.encode("utf-8"), 1, 9).decode()
     return gray
@@ -563,8 +609,12 @@ class FancyFormatter:
     This currently only works on Linux and Mac.
     """
 
-    def __init__(self, f_out: IO[str], f_err: IO[str], hide_error_codes: bool) -> None:
+    def __init__(
+        self, f_out: IO[str], f_err: IO[str], hide_error_codes: bool, hide_success: bool = False
+    ) -> None:
         self.hide_error_codes = hide_error_codes
+        self.hide_success = hide_success
+
         # Check if we are in a human-facing terminal on a supported platform.
         if sys.platform not in ("linux", "darwin", "win32", "emscripten"):
             self.dummy_term = True
@@ -606,8 +656,7 @@ class FancyFormatter:
         # Windows ANSI escape sequences are only supported on Threshold 2 and above.
         # we check with an assert at runtime and an if check for mypy, as asserts do not
         # yet narrow platform
-        assert sys.platform == "win32"
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # needed to find win specific sys apis
             winver = sys.getwindowsversion()
             if (
                 winver.major < MINIMUM_WINDOWS_MAJOR_VT100
@@ -629,11 +678,12 @@ class FancyFormatter:
             )
             self.initialize_vt100_colors()
             return True
-        return False
+        assert False, "Running not on Windows"
 
     def initialize_unix_colors(self) -> bool:
         """Return True if initialization was successful and we can use colors, False otherwise"""
-        if sys.platform == "win32" or not CURSES_ENABLED:
+        is_win = sys.platform == "win32"
+        if is_win or not CURSES_ENABLED:
             return False
         try:
             # setupterm wants a fd to potentially write an "initialization sequence".
@@ -689,6 +739,14 @@ class FancyFormatter:
             start += self.DIM
         return start + self.colors[color] + text + self.NORMAL
 
+    def is_marker_line(self, line: str) -> bool:
+        s_line = line.lstrip()
+        return (
+            line.startswith(CODE_START)
+            and s_line.startswith("^")
+            and set(s_line).issubset({"^", "~"})
+        )
+
     def fit_in_terminal(
         self, messages: list[str], fixed_terminal_width: int | None = None
     ) -> list[str]:
@@ -696,12 +754,12 @@ class FancyFormatter:
         width = fixed_terminal_width or get_terminal_width()
         new_messages = messages.copy()
         for i, error in enumerate(messages):
-            if ": error:" in error:
+            # TODO: detecting source code highlights through an indent can be surprising.
+            if not error.startswith(CODE_START) and ": error:" in error:
                 loc, msg = error.split("error:", maxsplit=1)
                 msg = soft_wrap(msg, width, first_offset=len(loc) + len("error: "))
                 new_messages[i] = loc + "error:" + msg
-            if error.startswith(" " * DEFAULT_SOURCE_OFFSET) and "^" not in error:
-                # TODO: detecting source code highlights through an indent can be surprising.
+            elif error.startswith(CODE_START) and not self.is_marker_line(error):
                 # Restore original error message and error location.
                 error = error[DEFAULT_SOURCE_OFFSET:]
                 marker_line = messages[i + 1]
@@ -728,7 +786,12 @@ class FancyFormatter:
 
     def colorize(self, error: str) -> str:
         """Colorize an output line by highlighting the status and error code."""
-        if ": error:" in error:
+        # TODO: detecting source code highlights through an indent can be surprising.
+        if error.startswith(CODE_START):
+            if not self.is_marker_line(error):
+                return self.style(error, "none", dim=True)
+            return self.style(error, "red")
+        elif ": error:" in error:
             loc, msg = error.split("error:", maxsplit=1)
             if self.hide_error_codes:
                 return (
@@ -750,11 +813,6 @@ class FancyFormatter:
             loc, msg = error.split("note:", maxsplit=1)
             formatted = self.highlight_quote_groups(self.underline_link(msg))
             return loc + self.style("note:", "blue") + formatted
-        elif error.startswith(" " * DEFAULT_SOURCE_OFFSET):
-            # TODO: detecting source code highlights through an indent can be surprising.
-            if "^" not in error:
-                return self.style(error, "none", dim=True)
-            return self.style(error, "red")
         else:
             return error
 
@@ -793,6 +851,9 @@ class FancyFormatter:
         n_sources is total number of files passed directly on command line,
         i.e. excluding stubs and followed imports.
         """
+        if self.hide_success:
+            return ""
+
         msg = f"Success: no issues found in {n_sources} source file{plural_s(n_sources)}"
         if not use_color:
             return msg
@@ -822,6 +883,18 @@ def is_typeshed_file(typeshed_dir: str | None, file: str) -> bool:
     typeshed_dir = typeshed_dir if typeshed_dir is not None else TYPESHED_DIR
     try:
         return os.path.commonpath((typeshed_dir, os.path.abspath(file))) == typeshed_dir
+    except ValueError:  # Different drives on Windows
+        return False
+
+
+def is_stdlib_file(typeshed_dir: str | None, file: str) -> bool:
+    if "stdlib" not in file:
+        # Fast path
+        return False
+    typeshed_dir = typeshed_dir if typeshed_dir is not None else TYPESHED_DIR
+    stdlib_dir = os.path.join(typeshed_dir, "stdlib")
+    try:
+        return os.path.commonpath((stdlib_dir, os.path.abspath(file))) == stdlib_dir
     except ValueError:  # Different drives on Windows
         return False
 
@@ -867,3 +940,121 @@ def quote_docstring(docstr: str) -> str:
         return f"''{docstr_repr}''"
     else:
         return f'""{docstr_repr}""'
+
+
+def json_dumps(obj: object, debug: bool = False) -> bytes:
+    if orjson is not None:
+        if debug:
+            dumps_option = orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS
+        else:
+            # TODO: If we don't sort keys here, testIncrementalInternalScramble fails
+            # We should document exactly what is going on there
+            dumps_option = orjson.OPT_SORT_KEYS
+
+        try:
+            return orjson.dumps(obj, option=dumps_option)  # type: ignore[no-any-return]
+        except TypeError as e:
+            if str(e) != "Integer exceeds 64-bit range":
+                raise
+
+    if debug:
+        return json.dumps(obj, indent=2, sort_keys=True).encode("utf-8")
+    else:
+        # See above for sort_keys comment
+        return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def json_loads(data: bytes) -> Any:
+    if orjson is not None:
+        return orjson.loads(data)
+    return json.loads(data)
+
+
+_AVAILABLE_THREADS: int | None = None
+
+
+def can_start_threads() -> bool:
+    """Can we start new threads?
+
+    WebAssembly builds are typically single-threaded, and starting a thread
+    fails with RuntimeError there, so we must not even try.
+    """
+    return sys.platform not in ("emscripten", "wasi")
+
+
+def get_available_threads() -> int:
+    """Determine number of physical cores that current process can use (best effort)."""
+    global _AVAILABLE_THREADS
+    if _AVAILABLE_THREADS is not None:
+        return _AVAILABLE_THREADS
+
+    # This takes into account -X cpu_count and/or PYTHON_CPU_COUNT, but always
+    # counts virtual cores (which is not what we want for CPU bound tasks).
+    os_cpu_count = os.cpu_count()
+    if PSUTIL_AVAILABLE:
+        # Unlike os, psutil can determine number of physical cores.
+        psutil_cpu_count = psutil.cpu_count(logical=False)
+    else:
+        psutil_cpu_count = None
+
+    if psutil_cpu_count and os_cpu_count:
+        cpu_count = min(psutil_cpu_count, os_cpu_count)
+    elif psutil_cpu_count or os_cpu_count:
+        cpu_count = psutil_cpu_count or os_cpu_count
+    else:
+        # A conservative fallback in case we cannot determine CPU count in any way.
+        cpu_count = 4
+
+    affinity: set[int] | list[int] | None = None
+    # Not available on old Python versions on some platforms.
+    if sys.platform == "linux":
+        affinity = os.sched_getaffinity(0)
+    if (
+        PSUTIL_AVAILABLE
+        # This matches platform availability in psutil docs.
+        and (psutil.LINUX or psutil.WINDOWS or psutil.FREEBSD)
+        # This is redundant, but needed for self-check.
+        and sys.platform != "darwin"
+    ):
+        affinity = psutil.Process().cpu_affinity()
+
+    assert cpu_count is not None
+    if affinity:
+        available_threads = min(cpu_count, len(affinity))
+    else:
+        available_threads = cpu_count
+    _AVAILABLE_THREADS = available_threads
+    return available_threads
+
+
+def hash_path_stem(s: str) -> int:
+    """Hash the stem of a cache file path (everything before the first dot in the basename).
+
+    This is a combined stem-extraction + hash function optimized for mypyc compilation.
+    Uses only integer arithmetic, avoiding intermediate string allocations.
+    """
+    # First find end of stem (scanning backwards, stop at first dot after last separator)
+    i = len(s) - 1
+    end: i64 = i
+    while i >= 0:
+        c: i64 = ord(s[i])
+        if c == ord("/") or c == ord("\\"):
+            break
+        if c == ord("."):
+            end = i
+        i -= 1
+    # Calculate hash
+    hv: i64 = 123
+    i = end
+    while i >= 0:
+        c = i64(ord(s[i]))
+        hv = (hv * 33) ^ c
+        i -= 1
+    # Murmur3 finalizer for better bit avalanche (improves shard uniformity)
+    hv = (hv ^ (hv >> 32)) & 0xFFFFFFFF
+    hv ^= hv >> 16
+    hv = (hv * 0x85EBCA6B) & 0xFFFFFFFF
+    hv ^= hv >> 13
+    hv = (hv * 0xC2B2AE35) & 0xFFFFFFFF
+    hv ^= hv >> 16
+    return int(hv)

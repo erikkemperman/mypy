@@ -8,7 +8,10 @@ import re
 import shutil
 import sys
 import time
-from typing import IO, Any, Callable, Iterable, Iterator, Pattern
+from collections import defaultdict
+from collections.abc import Callable, Iterable, Iterator
+from re import Pattern
+from typing import IO, Any
 
 # Exporting Suite as alias to TestCase for backwards compatibility
 # TODO: avoid aliasing - import and subclass TestCase directly
@@ -24,7 +27,13 @@ from mypy import defaults
 from mypy.main import process_options
 from mypy.options import Options
 from mypy.test.config import test_data_prefix, test_temp_dir
-from mypy.test.data import DataDrivenTestCase, DeleteFile, UpdateFile, fix_cobertura_filename
+from mypy.test.data import (
+    DataDrivenTestCase,
+    DeleteFile,
+    UpdateFile,
+    choose_file_encoding,
+    fix_cobertura_filename,
+)
 
 skip = pytest.mark.skip
 
@@ -41,7 +50,7 @@ def run_mypy(args: list[str]) -> None:
     if status != 0:
         sys.stdout.write(outval)
         sys.stderr.write(errval)
-        pytest.fail(msg="Sample check failed", pytrace=False)
+        pytest.fail(reason="Sample check failed", pytrace=False)
 
 
 def diff_ranges(
@@ -104,12 +113,64 @@ def render_diff_range(
             output.write("\n")
 
 
-def assert_string_arrays_equal(expected: list[str], actual: list[str], msg: str) -> None:
+def dump_original_errors(errors: list[str]) -> None:
+    sys.stderr.write("Original errors:\n")
+    for err in errors:
+        sys.stderr.write(err + "\n")
+
+
+def module_order(errors: list[str]) -> list[str]:
+    result = []
+    seen = set()
+    mods = []
+    for e in errors:
+        if ":" not in e:
+            dump_original_errors(errors)
+            pytest.fail(f"Only module scoped errors are supported, got {e}")
+        mod, _ = e.split(":", maxsplit=1)
+        mods.append(mod)
+    for i, mod in enumerate(mods):
+        if i > 0:
+            if mod != mods[i - 1] and mod in seen:
+                dump_original_errors(errors)
+                pytest.fail(f"Each module must form a single block, {mod} appears split")
+        if mod not in seen:
+            result.append(mod)
+            seen.add(mod)
+    return result
+
+
+def match_module_order(actual: list[str], expected_order: list[str]) -> list[str]:
+    actual_by_mod = defaultdict(list)
+    actual_order = module_order(actual)
+    if set(actual_order) != set(expected_order):
+        # Different files, give up and show actual errors.
+        return actual
+    for a in actual:
+        mod, _ = a.split(":", maxsplit=1)
+        actual_by_mod[mod].append(a)
+    result = []
+    for mod in expected_order:
+        result.extend(actual_by_mod[mod])
+    return result
+
+
+def assert_string_arrays_equal(
+    expected: list[str],
+    actual: list[str],
+    msg: str,
+    *,
+    traceback: bool = False,
+    ignore_modules_order: bool = False,
+) -> None:
     """Assert that two string arrays are equal.
 
     Display any differences in a human-readable form.
     """
     actual = clean_up(actual)
+    if ignore_modules_order:
+        expected_module_order = module_order(expected)
+        actual = match_module_order(actual, expected_module_order)
     if expected != actual:
         expected_ranges, actual_ranges = diff_ranges(expected, actual)
         sys.stderr.write("Expected:\n")
@@ -133,10 +194,10 @@ def assert_string_arrays_equal(expected: list[str], actual: list[str], msg: str)
             show_align_message(expected[first_diff], actual[first_diff])
 
         sys.stderr.write(
-            "Update the test output using --update-data -n0 "
-            "(you can additionally use the -k selector to update only specific tests)\n"
+            "Update the test output using --update-data "
+            "(implies -n0; you can additionally use the -k selector to update only specific tests)\n"
         )
-        pytest.fail(msg, pytrace=False)
+        pytest.fail(msg, pytrace=traceback)
 
 
 def assert_module_equivalence(name: str, expected: Iterable[str], actual: Iterable[str]) -> None:
@@ -229,6 +290,9 @@ def clean_up(a: list[str]) -> list[str]:
         for p in prefix, prefix.replace(os.sep, "/"):
             if p != "/" and p != "//" and p != "\\" and p != "\\\\":
                 ss = ss.replace(p, "")
+        # Replace memory address with zeros
+        if "at 0x" in ss:
+            ss = re.sub(r"(at 0x)\w+>", r"\g<1>000000000000>", ss)
         # Ignore spaces at end of line.
         ss = re.sub(" +$", "", ss)
         # Remove pwd from driver.py's path
@@ -254,18 +318,12 @@ def local_sys_path_set() -> Iterator[None]:
 
 
 def testfile_pyversion(path: str) -> tuple[int, int]:
-    if path.endswith("python312.test"):
-        return 3, 12
-    elif path.endswith("python311.test"):
-        return 3, 11
-    elif path.endswith("python310.test"):
-        return 3, 10
-    elif path.endswith("python39.test"):
-        return 3, 9
-    elif path.endswith("python38.test"):
-        return 3, 8
+    if m := re.search(r"python3([0-9]+)\.test$", path):
+        # For older unsupported version like python38,
+        # default to that earliest supported version.
+        return max((3, int(m.group(1))), defaults.PYTHON3_VERSION_MIN)
     else:
-        return defaults.PYTHON3_VERSION
+        return defaults.PYTHON3_VERSION_MIN
 
 
 def normalize_error_messages(messages: list[str]) -> list[str]:
@@ -356,8 +414,6 @@ def parse_options(
         options = Options()
         options.error_summary = False
         options.hide_error_codes = True
-        options.force_uppercase_builtins = True
-        options.force_union_syntax = True
 
     # Allow custom python version to override testfile_pyversion.
     if all(flag.split("=")[0] != "--python-version" for flag in flag_list):
@@ -365,6 +421,8 @@ def parse_options(
 
     if testcase.config.getoption("--mypy-verbose"):
         options.verbosity = testcase.config.getoption("--mypy-verbose")
+    if testcase.config.getoption("--mypy-num-workers"):
+        options.num_workers = testcase.config.getoption("--mypy-num-workers")
 
     return options
 
@@ -388,7 +446,7 @@ def write_and_fudge_mtime(content: str, target_path: str) -> None:
 
     dir = os.path.dirname(target_path)
     os.makedirs(dir, exist_ok=True)
-    with open(target_path, "w", encoding="utf-8") as target:
+    with open(target_path, "w", encoding=choose_file_encoding(target_path)) as target:
         target.write(content)
 
     if new_time:
@@ -416,8 +474,7 @@ def check_test_output_files(
     testcase: DataDrivenTestCase, step: int, strip_prefix: str = ""
 ) -> None:
     for path, expected_content in testcase.output_files:
-        if path.startswith(strip_prefix):
-            path = path[len(strip_prefix) :]
+        path = path.removeprefix(strip_prefix)
         if not os.path.exists(path):
             raise AssertionError(
                 "Expected file {} was not produced by test case{}".format(
@@ -445,6 +502,8 @@ def check_test_output_files(
             if testcase.suite.native_sep and os.path.sep == "\\":
                 normalized_output = [fix_cobertura_filename(line) for line in normalized_output]
             normalized_output = normalize_error_messages(normalized_output)
+        if os.path.basename(testcase.file) == "reports.test":
+            normalized_output = normalize_report_meta(normalized_output)
         assert_string_arrays_equal(
             expected_content.splitlines(),
             normalized_output,
@@ -468,9 +527,20 @@ def normalize_file_output(content: list[str], current_abs_path: str) -> list[str
     return result
 
 
+def normalize_report_meta(content: list[str]) -> list[str]:
+    # libxml 2.15 and newer emits the "modern" version of this <meta> element.
+    # Normalize the old style to look the same.
+    html_meta = '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">'
+    return ['<meta charset="UTF-8">' if x == html_meta else x for x in content]
+
+
 def find_test_files(pattern: str, exclude: list[str] | None = None) -> list[str]:
     return [
         path.name
         for path in (pathlib.Path(test_data_prefix).rglob(pattern))
         if path.name not in (exclude or [])
     ]
+
+
+def remove_typevar_ids(a: list[str]) -> list[str]:
+    return [re.sub(r"`-?\d+", "", line) for line in a]

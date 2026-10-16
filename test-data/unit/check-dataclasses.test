@@ -260,7 +260,7 @@ class FrozenBase:
     pass
 
 @dataclass
-class BadNormalDerived(FrozenBase):  # E: Cannot inherit non-frozen dataclass from a frozen one
+class BadNormalDerived(FrozenBase):  # E: Non-frozen dataclass cannot inherit from a frozen dataclass
     pass
 
 @dataclass
@@ -268,7 +268,7 @@ class NormalBase:
     pass
 
 @dataclass(frozen=True)
-class BadFrozenDerived(NormalBase):  # E: Cannot inherit frozen dataclass from a non-frozen one
+class BadFrozenDerived(NormalBase):  # E: Frozen dataclass cannot inherit from a non-frozen dataclass
     pass
 
 [builtins fixtures/dataclasses.pyi]
@@ -296,9 +296,9 @@ class Person:
     name: str
     age: int = field(init=None)  # E: No overload variant of "field" matches argument type "None" \
                                  # N: Possible overload variants: \
-                                 # N:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T \
-                                 # N:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T \
-                                 # N:     def field(*, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> Any
+                                 # N:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T \
+                                 # N:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T \
+                                 # N:     def field(*, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> Any
 
 [builtins fixtures/dataclasses.pyi]
 
@@ -329,7 +329,7 @@ class Person:
     enemy_names: List[str]
     nickname: Optional[str] = None
 
-reveal_type(Person)  # N: Revealed type is "def (name: builtins.str, friend_names: builtins.list[builtins.str], enemy_names: builtins.list[builtins.str], nickname: Union[builtins.str, None] =) -> __main__.Person"
+reveal_type(Person)  # N: Revealed type is "def (name: builtins.str, friend_names: builtins.list[builtins.str], enemy_names: builtins.list[builtins.str], nickname: builtins.str | None =) -> __main__.Person"
 
 [builtins fixtures/dataclasses.pyi]
 
@@ -378,7 +378,6 @@ class Application:
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnly]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass(kw_only=True)
@@ -398,7 +397,6 @@ Application(rating='name', name=123) # E: Argument "rating" to "Application" has
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnlyOnField]
-# flags: --python-version 3.10
 from dataclasses import dataclass, field
 
 @dataclass
@@ -417,7 +415,6 @@ Application(123, rating='name') # E: Argument 1 to "Application" has incompatibl
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnlyOnFieldFalse]
-# flags: --python-version 3.10
 from dataclasses import dataclass, field
 
 @dataclass
@@ -434,7 +431,6 @@ Application('name')  # E: Too few arguments for "Application"
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnlyWithSentinel]
-# flags: --python-version 3.10
 from dataclasses import dataclass, KW_ONLY
 
 @dataclass
@@ -452,26 +448,86 @@ Application('name', rating=123)  # E: Too many positional arguments for "Applica
 
 [builtins fixtures/dataclasses.pyi]
 
+[case testDataclassesOrderingKwOnlyWithPEP661Sentinel]
+-- Regression test for KW_ONLY implemented as a PEP 661 sentinel, as in
+-- https://github.com/python/cpython/commit/16952218d0535904236e8a39851133688c9ce1f0
+-- `_is_kw_only_type` must recognize this shape too, or `_` stops being excluded
+-- from `__init__` and kw-only ordering enforcement silently stops firing.
+from dataclasses import dataclass, KW_ONLY
+
+@dataclass
+class Application:
+    _: KW_ONLY
+    name: str = 'Unnamed'
+    rating: int
+
+Application(rating=5)
+Application('name', 123)  # E: Too many positional arguments for "Application"
+
+[file dataclasses.pyi]
+from typing import Any, Callable, TypeVar, overload
+from typing_extensions import sentinel
+
+_T = TypeVar("_T")
+
+KW_ONLY = sentinel("KW_ONLY")
+MISSING = sentinel("MISSING")
+
+class Field:
+    default: Any
+    default_factory: Any
+
+def field(
+    *,
+    default: Any = ...,
+    default_factory: Any = ...,
+    init: bool = ...,
+    repr: bool = ...,
+    hash: Any = ...,
+    compare: bool = ...,
+    metadata: Any = ...,
+    kw_only: Any = ...,
+) -> Any: ...
+@overload
+def dataclass(cls: type[_T]) -> type[_T]: ...
+@overload
+def dataclass(
+    cls: None = ...,
+    *,
+    init: bool = ...,
+    repr: bool = ...,
+    eq: bool = ...,
+    order: bool = ...,
+    unsafe_hash: bool = ...,
+    frozen: bool = ...,
+    match_args: bool = ...,
+    kw_only: bool = ...,
+    slots: bool = ...,
+    weakref_slot: bool = ...,
+) -> Callable[[type[_T]], type[_T]]: ...
+
+[builtins fixtures/dataclasses.pyi]
+
 [case testDataclassesOrderingKwOnlyWithSentinelAndFieldOverride]
-# flags: --python-version 3.10
 from dataclasses import dataclass, field, KW_ONLY
 
 @dataclass
 class Application:
     _: KW_ONLY
     name: str = 'Unnamed'
-    rating: int = field(kw_only=False)  # E: Attributes without a default cannot follow attributes with one
+    rating: int = field(kw_only=False)
 
 Application(name='name', rating=5)
-Application()  # E: Missing positional argument "name" in call to "Application"
-Application('name')  # E: Too many positional arguments for "Application" # E: Too few arguments for "Application"
-Application('name', 123)  # E: Too many positional arguments for "Application"
-Application('name', rating=123)  # E: Too many positional arguments for "Application"
-
+Application()  # E: Missing positional argument "rating" in call to "Application"
+Application(123)
+Application('name')  # E: Argument 1 to "Application" has incompatible type "str"; expected "int"
+Application('name', 123)  # E: Too many positional arguments for "Application" \
+                          # E: Argument 1 to "Application" has incompatible type "str"; expected "int" \
+                          # E: Argument 2 to "Application" has incompatible type "int"; expected "str"
+Application(123, rating=123)  # E: "Application" gets multiple values for keyword argument "rating"
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnlyWithSentinelAndSubclass]
-# flags: --python-version 3.10
 from dataclasses import dataclass, field, KW_ONLY
 
 @dataclass
@@ -498,7 +554,6 @@ D(123, False)  # E: Argument 1 to "D" has incompatible type "int"; expected "str
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesOrderingKwOnlyWithMultipleSentinel]
-# flags: --python-version 3.10
 from dataclasses import dataclass, field, KW_ONLY
 
 @dataclass
@@ -549,7 +604,7 @@ class A:
 
     @classmethod
     def foo(cls, x: Union[int, str]) -> Union[int, str]:
-        reveal_type(cls)            # N: Revealed type is "Type[__main__.A]"
+        reveal_type(cls)            # N: Revealed type is "type[__main__.A]"
         reveal_type(cls.other())    # N: Revealed type is "builtins.str"
         return x
 
@@ -615,6 +670,86 @@ reveal_type(x)  # N: Revealed type is "typing._SpecialForm"
 [builtins fixtures/dataclasses.pyi]
 [typing fixtures/typing-medium.pyi]
 
+[case testFunctionAliasDataclassNoCrash]
+from dataclasses import dataclass
+
+def fn(a: int) -> int:
+    return a
+
+@dataclass
+class Test:
+    foo = fn
+    foo: int = 42  # E: Name "foo" already defined on line 8
+
+reveal_type(Test.foo)  # N: Revealed type is "def (a: builtins.int) -> builtins.int"
+[builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-medium.pyi]
+
+[case testDataclassVariableBadRedefine]
+from dataclasses import dataclass
+
+@dataclass
+class Test:
+    foo = "test"
+    foo: int = 42  # E: Name "foo" already defined on line 5
+
+reveal_type(Test)  # N: Revealed type is "def () -> __main__.Test"
+reveal_type(Test.foo)  # N: Revealed type is "builtins.str"
+[builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-medium.pyi]
+
+[case testDataclassCallableAttrRegular]
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class Defer(Parent):
+    b: int
+
+@dataclass
+class Parent:
+    key: Callable[[], str]
+    a: int
+
+reveal_type(Parent)  # N: Revealed type is "def (key: def () -> builtins.str, a: builtins.int) -> __main__.Parent"
+[builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-medium.pyi]
+
+[case testDataclassCallableAttrDefault]
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass
+class Defer(Parent):
+    b: int = 0
+
+@dataclass
+class Parent:
+    key: Callable[[], str] = lambda: "yes"
+    a: int = 0
+
+reveal_type(Parent)  # N: Revealed type is "def (key: def () -> builtins.str =, a: builtins.int =) -> __main__.Parent"
+reveal_type(Parent.key)  # N: Revealed type is "def () -> builtins.str"
+[builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-medium.pyi]
+
+[case testDataclassCallableAttrFrozen]
+from dataclasses import dataclass
+from typing import Callable
+
+@dataclass(frozen=True)
+class Defer(Parent):
+    b: int
+
+@dataclass(frozen=True)
+class Parent:
+    key: Callable[[], str]
+    a: int
+
+reveal_type(Parent)  # N: Revealed type is "def (key: def () -> builtins.str, a: builtins.int) -> __main__.Parent"
+[builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-medium.pyi]
+
 [case testDataclassOrdering]
 from dataclasses import dataclass
 
@@ -677,7 +812,7 @@ class Application:
 class SpecializedApplication(Application):
   rating: int = 0
 
-reveal_type(SpecializedApplication)  # N: Revealed type is "def (id: Union[builtins.int, None], name: builtins.str, rating: builtins.int =) -> __main__.SpecializedApplication"
+reveal_type(SpecializedApplication)  # N: Revealed type is "def (id: builtins.int | None, name: builtins.str, rating: builtins.int =) -> __main__.SpecializedApplication"
 
 [builtins fixtures/dataclasses.pyi]
 
@@ -700,10 +835,10 @@ class A(Generic[T]):
     return self.z[0]
 
   def problem(self) -> T:
-    return self.z  # E: Incompatible return value type (got "List[T]", expected "T")
+    return self.z  # E: Incompatible return value type (got "list[T]", expected "T")
 
 reveal_type(A)  # N: Revealed type is "def [T] (x: T`1, y: T`1, z: builtins.list[T`1]) -> __main__.A[T`1]"
-A(1, 2, ["a", "b"])  # E: Cannot infer type argument 1 of "A"
+A(1, 2, ["a", "b"])  # E: Cannot infer value of type parameter "T" of "A"
 a = A(1, 2, [1, 2])
 reveal_type(a)  # N: Revealed type is "__main__.A[builtins.int]"
 reveal_type(a.x)  # N: Revealed type is "builtins.int"
@@ -836,8 +971,9 @@ class A(Generic[T]):
 
   @classmethod
   def foo(cls) -> None:
-      reveal_type(cls)  # N: Revealed type is "Type[__main__.A[T`1]]"
-      cls.x  # E: Access to generic instance variables via class is ambiguous
+      reveal_type(cls)  # N: Revealed type is "type[__main__.A[T`1]]"
+      cls.x  # E: Cannot access instance-only attribute "x" on class object \
+             # E: Access to generic instance variables via class is ambiguous
 
   @classmethod
   def other(cls, x: T) -> A[T]: ...
@@ -936,7 +1072,7 @@ T = TypeVar('T', bound='A')
 class A:
     @classmethod
     def make(cls: Type[T]) -> T:
-        reveal_type(cls)  # N: Revealed type is "Type[T`-1]"
+        reveal_type(cls)  # N: Revealed type is "type[T`-1]"
         reveal_type(cls())  # N: Revealed type is "T`-1"
         return cls()
 [builtins fixtures/dataclasses.pyi]
@@ -1256,6 +1392,26 @@ class Person:
 
 [builtins fixtures/dataclasses.pyi]
 
+[case testDataclassesFloatSerializationIncremental]
+import m
+[file m.py]
+from lib import MyDataClass
+[file m.py.2]
+from lib import MyDataClass
+
+reveal_type(MyDataClass.MY_CONSTANT)
+[file lib.py]
+from dataclasses import dataclass
+from typing import Final
+
+@dataclass(kw_only=True, repr=False)
+class MyDataClass:
+    MY_CONSTANT: Final = 1.234
+[builtins fixtures/dataclasses.pyi]
+[out]
+[out2]
+tmp/m.py:3: note: Revealed type is "Literal[1.234]?"
+
 [case testDataclassesDefaultsMroOtherFile]
 import a
 
@@ -1386,11 +1542,11 @@ class Foo:
     bar: float = field(**{"repr": False})
 [out]
 main:6: error: Unpacking **kwargs in "field()" is not supported
-main:6: error: No overload variant of "field" matches argument type "Dict[str, bool]"
+main:6: error: No overload variant of "field" matches argument type "dict[str, bool]"
 main:6: note: Possible overload variants:
-main:6: note:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T
-main:6: note:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T
-main:6: note:     def field(*, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> Any
+main:6: note:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T
+main:6: note:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T
+main:6: note:     def field(*, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> Any
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassFieldWithPositionalArguments]
@@ -1401,14 +1557,14 @@ class C:
     x: int = field(0)  # E: "field()" does not accept positional arguments \
                        # E: No overload variant of "field" matches argument type "int" \
                        # N: Possible overload variants: \
-                       # N:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T \
-                       # N:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> _T \
-                       # N:     def field(*, init: bool = ..., repr: bool = ..., hash: Optional[bool] = ..., compare: bool = ..., metadata: Optional[Mapping[str, Any]] = ..., kw_only: bool = ...) -> Any
+                       # N:     def [_T] field(*, default: _T, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T \
+                       # N:     def [_T] field(*, default_factory: Callable[[], _T], init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> _T \
+                       # N:     def field(*, init: bool = ..., repr: bool = ..., hash: bool | None = ..., compare: bool = ..., metadata: Mapping[str, Any] | None = ..., kw_only: bool = ...) -> Any
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassFieldWithTypedDictUnpacking]
 from dataclasses import dataclass, field
-from typing_extensions import TypedDict
+from typing import TypedDict
 
 class FieldKwargs(TypedDict):
     repr: bool
@@ -1421,9 +1577,9 @@ class Foo:
 
 reveal_type(Foo(bar=1.5))  # N: Revealed type is "__main__.Foo"
 [builtins fixtures/dataclasses.pyi]
+[typing fixtures/typing-typeddict.pyi]
 
 [case testDataclassWithSlotsArg]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass(slots=True)
@@ -1439,7 +1595,6 @@ class Some:
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassWithSlotsDef]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass(slots=False)
@@ -1456,7 +1611,6 @@ class Some:
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassWithSlotsDerivedFromNonSlot]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 class A:
@@ -1472,7 +1626,6 @@ class B(A):
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassWithSlotsConflict]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass(slots=True)
@@ -1493,24 +1646,7 @@ class DynamicDef:  # E: "DynamicDef" both defines "__slots__" and is used with "
     x: int
 [builtins fixtures/dataclasses.pyi]
 
-[case testDataclassWithSlotsArgBefore310]
-# flags: --python-version 3.9
-from dataclasses import dataclass
-
-@dataclass(slots=True)  # E: Keyword argument "slots" for "dataclass" is only valid in Python 3.10 and higher
-class Some:
-    x: int
-
-# Possible conflict:
-@dataclass(slots=True)  # E: Keyword argument "slots" for "dataclass" is only valid in Python 3.10 and higher
-class Other:
-    __slots__ = ('x',)
-    x: int
-[builtins fixtures/dataclasses.pyi]
-
-
 [case testDataclassWithSlotsRuntimeAttr]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass(slots=True)
@@ -1519,14 +1655,14 @@ class Some:
     y: str
     z: bool
 
-reveal_type(Some.__slots__)  # N: Revealed type is "Tuple[builtins.str, builtins.str, builtins.str]"
+reveal_type(Some.__slots__)  # N: Revealed type is "tuple[builtins.str, builtins.str, builtins.str]"
 
 @dataclass(slots=True)
 class Other:
     x: int
     y: str
 
-reveal_type(Other.__slots__)  # N: Revealed type is "Tuple[builtins.str, builtins.str]"
+reveal_type(Other.__slots__)  # N: Revealed type is "tuple[builtins.str, builtins.str]"
 
 
 @dataclass
@@ -1534,12 +1670,11 @@ class NoSlots:
     x: int
     y: str
 
-NoSlots.__slots__  # E: "Type[NoSlots]" has no attribute "__slots__"
+NoSlots.__slots__  # E: "type[NoSlots]" has no attribute "__slots__"
 [builtins fixtures/dataclasses.pyi]
 
 
 [case testSlotsDefinitionWithTwoPasses1]
-# flags: --python-version 3.10
 # https://github.com/python/mypy/issues/11821
 from typing import TypeVar, Protocol, Generic
 from dataclasses import dataclass
@@ -1557,7 +1692,6 @@ class Node(Generic[V]):  # Error was here
 [builtins fixtures/dataclasses.pyi]
 
 [case testSlotsDefinitionWithTwoPasses2]
-# flags: --python-version 3.10
 from typing import TypeVar, Protocol, Generic
 from dataclasses import dataclass
 
@@ -1575,7 +1709,6 @@ class Node(Generic[V]):  # E: "Node" both defines "__slots__" and is used with "
 [builtins fixtures/dataclasses.pyi]
 
 [case testSlotsDefinitionWithTwoPasses3]
-# flags: --python-version 3.10
 from typing import TypeVar, Protocol, Generic
 from dataclasses import dataclass
 
@@ -1593,7 +1726,6 @@ class Node(Generic[V]):  # E: "Node" both defines "__slots__" and is used with "
 [builtins fixtures/dataclasses.pyi]
 
 [case testSlotsDefinitionWithTwoPasses4]
-# flags: --python-version 3.10
 import dataclasses as dtc
 
 PublishedMessagesVar = dict[int, 'PublishedMessages']
@@ -1601,6 +1733,19 @@ PublishedMessagesVar = dict[int, 'PublishedMessages']
 @dtc.dataclass(frozen=True, slots=True)
 class PublishedMessages:
     left: int
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassSlotsWithDeferredBase]
+from dataclasses import dataclass
+
+@dataclass
+class A(B): ...
+
+@dataclass
+class B: ...
+
+@dataclass(slots=True)
+class C: ...
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesAnyInherit]
@@ -1637,6 +1782,34 @@ A(a=func).a()
 A(a=func).a = func  # E: Property "a" defined in "A" is read-only
 [builtins fixtures/dataclasses.pyi]
 
+[case testDataclassesCallableFrozenOverride]
+from dataclasses import dataclass
+from typing import Callable
+@dataclass(frozen=True)
+class A:
+    a: Callable[[int], str] = lambda x: "yes"
+
+def foo(x: int) -> str:
+    return "no"
+
+@dataclass(frozen=True)
+class Sub(A):
+    # This is no-op for attribute access on instances,
+    # so we effectively check the subtyping as if accessed on class.
+    a = foo
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassesCallableFrozenSelf]
+from dataclasses import dataclass
+from typing import Self, Callable
+@dataclass(frozen=True)
+class A:
+    a: Callable[[Self], str]
+
+a: A
+reveal_type(a.a)  # N: Revealed type is "def (__main__.A) -> builtins.str"
+[builtins fixtures/dataclasses.pyi]
+
 [case testDataclassInFunctionDoesNotCrash]
 from dataclasses import dataclass
 
@@ -1651,7 +1824,6 @@ def foo() -> None:
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassesMultipleInheritanceWithNonDataclass]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 
 @dataclass
@@ -1709,8 +1881,8 @@ class Parent(Generic[T]):
 @dataclass
 class Child(Parent):
     y: Optional[int]
-Child(x=1, y=1)  # E: Argument "x" to "Child" has incompatible type "int"; expected "Optional[str]"
-Child(x='', y='')  # E: Argument "y" to "Child" has incompatible type "str"; expected "Optional[int]"
+Child(x=1, y=1)  # E: Argument "x" to "Child" has incompatible type "int"; expected "str | None"
+Child(x='', y='')  # E: Argument "y" to "Child" has incompatible type "str"; expected "int | None"
 Child(x='', y=1)
 Child(x=None, y=None)
 [builtins fixtures/dataclasses.pyi]
@@ -1826,28 +1998,41 @@ class MyClass(MyGeneric[MyDataclass]): ...
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassWithMatchArgs]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 @dataclass
 class One:
     bar: int
     baz: str
 o: One
-reveal_type(o.__match_args__)  # N: Revealed type is "Tuple[Literal['bar'], Literal['baz']]"
+reveal_type(o.__match_args__)  # N: Revealed type is "tuple[Literal['bar'], Literal['baz']]"
 @dataclass(match_args=True)
 class Two:
     bar: int
 t: Two
-reveal_type(t.__match_args__)  # N: Revealed type is "Tuple[Literal['bar']]"
+reveal_type(t.__match_args__)  # N: Revealed type is "tuple[Literal['bar']]"
 @dataclass
 class Empty:
     ...
 e: Empty
-reveal_type(e.__match_args__)  # N: Revealed type is "Tuple[()]"
+reveal_type(e.__match_args__)  # N: Revealed type is "tuple[()]"
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassWithMatchArgsAndKwOnly]
+from dataclasses import dataclass, field
+@dataclass(kw_only=True)
+class One:
+    a: int
+    b: str
+reveal_type(One.__match_args__)  # N: Revealed type is "tuple[()]"
+
+@dataclass(kw_only=True)
+class Two:
+    a: int = field(kw_only=False)
+    b: str
+reveal_type(Two.__match_args__)  # N: Revealed type is "tuple[Literal['a']]"
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassWithoutMatchArgs]
-# flags: --python-version 3.10
 from dataclasses import dataclass
 @dataclass(match_args=False)
 class One:
@@ -1855,23 +2040,6 @@ class One:
     baz: str
 o: One
 reveal_type(o.__match_args__)  # E: "One" has no attribute "__match_args__" \
-                               # N: Revealed type is "Any"
-[builtins fixtures/dataclasses.pyi]
-
-[case testDataclassWithMatchArgsOldVersion]
-# flags: --python-version 3.9
-from dataclasses import dataclass
-@dataclass(match_args=True)
-class One:
-    bar: int
-o: One
-reveal_type(o.__match_args__)  # E: "One" has no attribute "__match_args__" \
-                               # N: Revealed type is "Any"
-@dataclass
-class Two:
-    bar: int
-t: Two
-reveal_type(t.__match_args__)  # E: "Two" has no attribute "__match_args__" \
                                # N: Revealed type is "Any"
 [builtins fixtures/dataclasses.pyi]
 
@@ -1894,7 +2062,6 @@ SecondClass().SECOND_CONST = 42  # E: Cannot assign to final attribute "SECOND_C
 [builtins fixtures/dataclasses.pyi]
 
 [case testDataclassFieldsProtocol]
-# flags: --python-version 3.9
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -1941,16 +2108,16 @@ class LinkedList(Generic[T]):
     next: Optional[Self] = None
 
     def meth(self) -> None:
-        reveal_type(self.next)  # N: Revealed type is "Union[Self`0, None]"
+        reveal_type(self.next)  # N: Revealed type is "Self`0 | None"
 
 l_int: LinkedList[int] = LinkedList(1, LinkedList("no", None))  # E: Argument 1 to "LinkedList" has incompatible type "str"; expected "int"
 
 @dataclass
 class SubLinkedList(LinkedList[int]): ...
 
-lst = SubLinkedList(1, LinkedList(2))  # E: Argument 2 to "SubLinkedList" has incompatible type "LinkedList[int]"; expected "Optional[SubLinkedList]"
-reveal_type(lst.next)  # N: Revealed type is "Union[__main__.SubLinkedList, None]"
-reveal_type(SubLinkedList)  # N: Revealed type is "def (value: builtins.int, next: Union[__main__.SubLinkedList, None] =) -> __main__.SubLinkedList"
+lst = SubLinkedList(1, LinkedList(2))  # E: Argument 2 to "SubLinkedList" has incompatible type "LinkedList[int]"; expected "SubLinkedList | None"
+reveal_type(lst.next)  # N: Revealed type is "__main__.SubLinkedList | None"
+reveal_type(SubLinkedList)  # N: Revealed type is "def (value: builtins.int, next: __main__.SubLinkedList | None =) -> __main__.SubLinkedList"
 [builtins fixtures/dataclasses.pyi]
 
 [case testNoCrashOnNestedGenericCallable]
@@ -2079,10 +2246,10 @@ class B:
 
 a_or_b: Union[A[int], B]
 _ = replace(a_or_b, x=42, y=True, init_var=42)
-_ = replace(a_or_b, x=42, y=True)  # E: Missing named argument "init_var" for "replace" of "Union[A[int], B]"
-_ = replace(a_or_b, x=42, y=True, z='42', init_var=42)  # E: Argument "z" to "replace" of "Union[A[int], B]" has incompatible type "str"; expected Never
-_ = replace(a_or_b, x=42, y=True, w={}, init_var=42)  # E: Argument "w" to "replace" of "Union[A[int], B]" has incompatible type "Dict[Never, Never]"; expected Never
-_ = replace(a_or_b, y=42, init_var=42)  # E: Argument "y" to "replace" of "Union[A[int], B]" has incompatible type "int"; expected "bool"
+_ = replace(a_or_b, x=42, y=True)  # E: Missing named argument "init_var" for "replace" of "A[int] | B"
+_ = replace(a_or_b, x=42, y=True, z='42', init_var=42)  # E: Argument "z" to "replace" of "A[int] | B" has incompatible type "str"; expected "Never"
+_ = replace(a_or_b, x=42, y=True, w={}, init_var=42)  # E: Argument "w" to "replace" of "A[int] | B" has incompatible type "dict[Never, Never]"; expected "Never"
+_ = replace(a_or_b, y=42, init_var=42)  # E: Argument "y" to "replace" of "A[int] | B" has incompatible type "int"; expected "bool"
 
 [builtins fixtures/tuple.pyi]
 
@@ -2104,7 +2271,7 @@ TA = TypeVar('TA', bound=A)
 TB = TypeVar('TB', bound=B)
 
 def f(b_or_t: Union[TA, TB, int]) -> None:
-    a2 = replace(b_or_t)   # E: Value of type variable "_DataclassT" of "replace" cannot be "Union[TA, TB, int]"
+    a2 = replace(b_or_t)   # E: Value of type variable "_DataclassT" of "replace" cannot be "TA | TB | int"
 
 [builtins fixtures/tuple.pyi]
 
@@ -2186,7 +2353,7 @@ from dataclasses import is_dataclass, replace
 def f(x: object) -> None:
   _ = replace(x)  # E: Value of type variable "_DataclassT" of "replace" cannot be "object"
   if is_dataclass(x):
-    _ = replace(x)  # E: Value of type variable "_DataclassT" of "replace" cannot be "Union[DataclassInstance, Type[DataclassInstance]]"
+    _ = replace(x)  # E: Value of type variable "_DataclassT" of "replace" cannot be "DataclassInstance | type[DataclassInstance]"
     if not isinstance(x, type):
       _ = replace(x)
 
@@ -2407,7 +2574,7 @@ main:7: note:      Superclass:
 main:7: note:          def __post_init__(self: Test, y: str) -> None
 main:7: note:      Subclass:
 main:7: note:          @classmethod
-main:7: note:          def __post_init__(cls: Type[Test]) -> None
+main:7: note:          def __post_init__(cls: type[Test]) -> None
 
 [case testPostInitStaticMethod]
 from dataclasses import dataclass, InitVar
@@ -2475,3 +2642,349 @@ class Base:
 class Child(Base):
     y: int
 [builtins fixtures/dataclasses.pyi]
+
+[case testDataclassesInitVarsWithProperty]
+from dataclasses import InitVar, dataclass, field
+
+@dataclass
+class Test:
+    foo: InitVar[str]
+    _foo: str = field(init=False)
+
+    def __post_init__(self, foo: str) -> None:
+        self._foo = foo
+
+    @property
+    def foo(self) -> str:
+        return self._foo
+
+    @foo.setter
+    def foo(self, value: str) -> None:
+        self._foo = value
+
+reveal_type(Test)  # N: Revealed type is "def (foo: builtins.str) -> __main__.Test"
+test = Test(42)  # E: Argument 1 to "Test" has incompatible type "int"; expected "str"
+test = Test("foo")
+test.foo
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassesDefaultValueInitVarWithProperty]
+from dataclasses import InitVar, dataclass, field
+
+@dataclass
+class Test:
+    foo: InitVar[str] = "foo"
+    _foo: str = field(init=False)
+
+    def __post_init__(self, foo: str) -> None:
+        self._foo = foo
+
+    @property  # E: InitVar with default value cannot be redefined
+    def foo(self) -> str:
+        return self._foo
+
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassesWithProperty]
+from dataclasses import dataclass
+
+@dataclass
+class Test:
+    @property
+    def foo(self) -> str:
+        return "a"
+
+    @foo.setter
+    def foo(self, value: str) -> None:
+        pass
+[builtins fixtures/dataclasses.pyi]
+
+[case testDataclassInheritanceWorksWithExplicitOverridesAndOrdering]
+# flags: --enable-error-code explicit-override
+from dataclasses import dataclass
+
+@dataclass(order=True)
+class Base:
+    x: int
+
+@dataclass(order=True)
+class Child(Base):
+    y: int
+[builtins fixtures/dataclasses.pyi]
+
+[case testDunderReplacePresent]
+# flags: --python-version 3.13
+from dataclasses import dataclass, field
+
+@dataclass
+class Coords:
+    x: int
+    y: int
+    # non-init fields are not allowed with replace:
+    z: int = field(init=False)
+
+
+replaced = Coords(2, 4).__replace__(x=2, y=5)
+reveal_type(replaced)  # N: Revealed type is "__main__.Coords"
+
+replaced = Coords(2, 4).__replace__(x=2)
+reveal_type(replaced)  # N: Revealed type is "__main__.Coords"
+
+Coords(2, 4).__replace__(x="asdf")  # E: Argument "x" to "__replace__" of "Coords" has incompatible type "str"; expected "int"
+Coords(2, 4).__replace__(23)          # E: Too many positional arguments for "__replace__" of "Coords"
+Coords(2, 4).__replace__(23, 25)      # E: Too many positional arguments for "__replace__" of "Coords"
+Coords(2, 4).__replace__(x=23, y=25, z=42)  # E: Unexpected keyword argument "z" for "__replace__" of "Coords"
+
+from typing import Generic, TypeVar
+T = TypeVar('T')
+
+@dataclass
+class Gen(Generic[T]):
+    x: T
+
+replaced_2 = Gen(2).__replace__(x=2)
+reveal_type(replaced_2)  # N: Revealed type is "__main__.Gen[builtins.int]"
+Gen(2).__replace__(x="not an int")  # E: Argument "x" to "__replace__" of "Gen" has incompatible type "str"; expected "int"
+
+[builtins fixtures/tuple.pyi]
+
+[case testDunderReplaceAllowsCovariantDataclassField]
+# flags: --python-version 3.13
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T_co = TypeVar("T_co", covariant=True)
+
+@dataclass(frozen=True)
+class A(Generic[T_co]):
+    value: T_co
+
+class B(Generic[T_co]):
+    def __replace__(self, *, value: T_co) -> B[T_co]:
+        return self
+
+[builtins fixtures/tuple.pyi]
+
+[case testDunderReplaceCovariantOverride]
+# flags: --python-version 3.13  --enable-error-code mutable-override
+from dataclasses import dataclass
+from typing import Optional
+from typing_extensions import dataclass_transform
+
+@dataclass
+class Base:
+    a: Optional[int]
+
+@dataclass
+class Child(Base):
+    a: int  # E: Covariant override of a mutable attribute (base class "Base" defined the type as "int | None", expression has type "int")
+
+@dataclass
+class Other(Base):
+    a: str  # E: Incompatible types in assignment (expression has type "str", base class "Base" defined the type as "int | None")
+
+@dataclass_transform(kw_only_default=True)
+class DCMeta(type): ...
+
+class X(metaclass=DCMeta):
+    a: Optional[int]
+
+class Y(X):
+    a: int  # E: Covariant override of a mutable attribute (base class "X" defined the type as "int | None", expression has type "int")
+[builtins fixtures/tuple.pyi]
+
+
+[case testDunderReplaceDoesNotBlockPlainIssubclassNarrowing]
+# https://github.com/python/mypy/issues/21635
+# flags: --python-version 3.13
+from dataclasses import dataclass
+
+@dataclass
+class A: ...
+@dataclass
+class M: ...
+@dataclass
+class B(A): ...
+@dataclass
+class C(M, A): ...
+
+cls: type[A] = C
+if issubclass(cls, M):
+    reveal_type(cls)  # N: Revealed type is "type[__main__.<subclass of "__main__.A" and "__main__.M">]"
+    n: int = 'foo'  # E: Incompatible types in assignment (expression has type "str", variable has type "int")
+[builtins fixtures/isinstancelist.pyi]
+
+
+[case testFrozenWithFinal]
+from dataclasses import dataclass
+from typing import Final
+
+@dataclass(frozen=True)
+class My:
+    a: Final = 1
+    b: Final[int] = 2
+
+reveal_type(My.a)  # N: Revealed type is "Literal[1]?"
+reveal_type(My.b)  # N: Revealed type is "builtins.int"
+My.a = 1  # E: Cannot assign to final attribute "a"
+My.b = 2  # E: Cannot assign to final attribute "b"
+
+m = My()
+reveal_type(m.a)  # N: Revealed type is "Literal[1]?"
+reveal_type(m.b)  # N: Revealed type is "builtins.int"
+
+m.a = 1  # E: Cannot assign to final attribute "a"
+m.b = 2  # E: Cannot assign to final attribute "b"
+[builtins fixtures/tuple.pyi]
+
+[case testNoCrashForDataclassNamedTupleCombination]
+# flags: --python-version 3.13
+from dataclasses import dataclass
+from typing import NamedTuple
+
+@dataclass
+class A(NamedTuple):  # E: A NamedTuple cannot be a dataclass
+    i: int
+
+class B1(NamedTuple):
+    i: int
+@dataclass
+class B2(B1):  # E: A NamedTuple cannot be a dataclass
+    pass
+
+[builtins fixtures/tuple.pyi]
+
+[case testDataclassesTypeGuard]
+import dataclasses
+
+raw_target: object
+
+if isinstance(raw_target, type) and dataclasses.is_dataclass(raw_target):
+    reveal_type(raw_target)  # N: Revealed type is "type[dataclasses.DataclassInstance]"
+[builtins fixtures/tuple.pyi]
+
+[case testDataclassKwOnlyArgsLast]
+from dataclasses import dataclass, field
+
+@dataclass
+class User:
+    id: int = field(kw_only=True)
+    name: str
+
+User("Foo", id=0)
+[builtins fixtures/tuple.pyi]
+
+[case testDataclassKwOnlyArgsDefaultAllowedNonLast]
+from dataclasses import dataclass, field
+
+@dataclass
+class User:
+    id: int = field(kw_only=True, default=0)
+    name: str
+
+User()  # E: Missing positional argument "name" in call to "User"
+User("")
+User(0)  # E: Argument 1 to "User" has incompatible type "int"; expected "str"
+User("", 0)  # E: Too many positional arguments for "User"
+User("", id=0)
+User("", name="")  # E: "User" gets multiple values for keyword argument "name"
+[builtins fixtures/tuple.pyi]
+
+[case testDataclassDefaultFactoryTypedDict]
+from dataclasses import dataclass, field
+from mypy_extensions import TypedDict
+
+class Person(TypedDict, total=False):
+    name: str
+
+@dataclass
+class Job:
+    person: Person = field(default_factory=Person)
+
+class PersonBad(TypedDict):
+    name: str
+
+@dataclass
+class JobBad:
+    person: PersonBad = field(default_factory=PersonBad)  # E: Argument "default_factory" to "field" has incompatible type "type[PersonBad]"; expected "Callable[[], PersonBad]"
+[builtins fixtures/dict.pyi]
+
+[case testDataclassInitVarRedefinitionNoCrash]
+# https://github.com/python/mypy/issues/19443
+from dataclasses import InitVar, dataclass
+
+class ClassA:
+    def value(self) -> int:
+        return 0
+
+@dataclass
+class ClassB(ClassA):
+    value: InitVar[int]
+
+    def value(self) -> int:
+        return 0
+[builtins fixtures/dict.pyi]
+
+[case testDataclassAllowsFinalField]
+# flags: --python-version=3.13
+from dataclasses import InitVar, dataclass
+from typing import Final, ClassVar
+
+@dataclass
+class C:
+    x: int
+    y: Final[int]
+    z: ClassVar[Final[int]] = 4
+
+c = C(1, 2)
+c.y = 3  # E: Cannot assign to final attribute "y"
+
+@dataclass
+class D(C):
+    x: Final[int]  # E: Cannot override writable attribute "x" with a final one
+
+@dataclass
+class Bad1:
+    x: Final[InitVar[int]]  # E: InitVar cannot be final
+
+@dataclass
+class Bad2:
+    x: InitVar[Final[int]]  # E: Final can be only used as an outermost qualifier in a variable annotation
+[builtins fixtures/dict.pyi]
+
+[case testNoCrashOnNestedSpecialFormsWithAnnotations]
+import dataclasses
+from typing import ClassVar, NamedTuple
+from typing_extensions import TypedDict
+
+@dataclasses.dataclass
+class X:
+    a: int
+    TD: ClassVar = TypedDict("TD", {"a": int})  # E: Cannot declare the type of a TypedDict declaration
+    NT: ClassVar = NamedTuple("NT", [("a", int)])  # E: Cannot declare the type of a NamedTuple declaration
+
+reveal_type(X)  # N: Revealed type is "def (a: builtins.int) -> __main__.X"
+reveal_type(X.TD)  # N: Revealed type is "def (*, a: builtins.int) -> TypedDict('__main__.X.TD', {'a': builtins.int})"
+reveal_type(X.NT)  # N: Revealed type is "def (a: builtins.int) -> tuple[builtins.int, fallback=__main__.X.NT]"
+
+tdx: X.TD
+ntx: X.NT
+reveal_type(tdx)  # N: Revealed type is "TypedDict('__main__.X.TD', {'a': builtins.int})"
+reveal_type(ntx)  # N: Revealed type is "tuple[builtins.int, fallback=__main__.X.NT]"
+
+@dataclasses.dataclass
+class XOK:
+    a: int
+    TD = TypedDict("TD", {"a": int})
+    NT = NamedTuple("NT", [("a", int)])
+
+reveal_type(XOK)  # N: Revealed type is "def (a: builtins.int) -> __main__.XOK"
+reveal_type(XOK.TD)  # N: Revealed type is "def (*, a: builtins.int) -> TypedDict('__main__.XOK.TD', {'a': builtins.int})"
+reveal_type(XOK.NT)  # N: Revealed type is "def (a: builtins.int) -> tuple[builtins.int, fallback=__main__.XOK.NT]"
+
+td: XOK.TD
+nt: XOK.NT
+
+reveal_type(td)  # N: Revealed type is "TypedDict('__main__.XOK.TD', {'a': builtins.int})"
+reveal_type(nt)  # N: Revealed type is "tuple[builtins.int, fallback=__main__.XOK.NT]"
+[builtins fixtures/dict.pyi]

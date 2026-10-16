@@ -1,13 +1,15 @@
 import ssl
 import sys
-from _typeshed import StrPath
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
-from typing import Any, SupportsIndex
-from typing_extensions import Self, TypeAlias
+from _typeshed import ReadableBuffer, StrPath
+from collections.abc import Awaitable, Callable, Iterable, Sequence, Sized
+from types import ModuleType
+from typing import Any, Protocol, SupportsIndex, TypeAlias, type_check_only
+from typing_extensions import Self
 
 from . import events, protocols, transports
 from .base_events import Server
 
+# Keep asyncio.__all__ updated with any changes to __all__ here
 if sys.platform == "win32":
     __all__ = ("StreamReader", "StreamWriter", "StreamReaderProtocol", "open_connection", "start_server")
 else:
@@ -23,66 +25,34 @@ else:
 
 _ClientConnectedCallback: TypeAlias = Callable[[StreamReader, StreamWriter], Awaitable[None] | None]
 
-if sys.version_info >= (3, 10):
-    async def open_connection(
-        host: str | None = None,
-        port: int | str | None = None,
-        *,
-        limit: int = 65536,
-        ssl_handshake_timeout: float | None = ...,
-        **kwds: Any,
-    ) -> tuple[StreamReader, StreamWriter]: ...
-    async def start_server(
-        client_connected_cb: _ClientConnectedCallback,
-        host: str | Sequence[str] | None = None,
-        port: int | str | None = None,
-        *,
-        limit: int = 65536,
-        ssl_handshake_timeout: float | None = ...,
-        **kwds: Any,
-    ) -> Server: ...
+@type_check_only
+class _ReaduntilBuffer(ReadableBuffer, Sized, Protocol): ...
 
-else:
-    async def open_connection(
-        host: str | None = None,
-        port: int | str | None = None,
-        *,
-        loop: events.AbstractEventLoop | None = None,
-        limit: int = 65536,
-        ssl_handshake_timeout: float | None = ...,
-        **kwds: Any,
-    ) -> tuple[StreamReader, StreamWriter]: ...
-    async def start_server(
-        client_connected_cb: _ClientConnectedCallback,
-        host: str | None = None,
-        port: int | str | None = None,
-        *,
-        loop: events.AbstractEventLoop | None = None,
-        limit: int = 65536,
-        ssl_handshake_timeout: float | None = ...,
-        **kwds: Any,
-    ) -> Server: ...
+async def open_connection(
+    host: str | None = None,
+    port: int | str | None = None,
+    *,
+    limit: int = 65536,
+    ssl_handshake_timeout: float | None = None,
+    **kwds: Any,
+) -> tuple[StreamReader, StreamWriter]: ...
+async def start_server(
+    client_connected_cb: _ClientConnectedCallback,
+    host: str | Sequence[str] | None = None,
+    port: int | str | None = None,
+    *,
+    limit: int = 65536,
+    ssl_handshake_timeout: float | None = None,
+    **kwds: Any,
+) -> Server: ...
 
 if sys.platform != "win32":
-    if sys.version_info >= (3, 10):
-        async def open_unix_connection(
-            path: StrPath | None = None, *, limit: int = 65536, **kwds: Any
-        ) -> tuple[StreamReader, StreamWriter]: ...
-        async def start_unix_server(
-            client_connected_cb: _ClientConnectedCallback, path: StrPath | None = None, *, limit: int = 65536, **kwds: Any
-        ) -> Server: ...
-    else:
-        async def open_unix_connection(
-            path: StrPath | None = None, *, loop: events.AbstractEventLoop | None = None, limit: int = 65536, **kwds: Any
-        ) -> tuple[StreamReader, StreamWriter]: ...
-        async def start_unix_server(
-            client_connected_cb: _ClientConnectedCallback,
-            path: StrPath | None = None,
-            *,
-            loop: events.AbstractEventLoop | None = None,
-            limit: int = 65536,
-            **kwds: Any,
-        ) -> Server: ...
+    async def open_unix_connection(
+        path: StrPath | None = None, *, limit: int = 65536, **kwds: Any
+    ) -> tuple[StreamReader, StreamWriter]: ...
+    async def start_unix_server(
+        client_connected_cb: _ClientConnectedCallback, path: StrPath | None = None, *, limit: int = 65536, **kwds: Any
+    ) -> Server: ...
 
 class FlowControlMixin(protocols.Protocol):
     def __init__(self, loop: events.AbstractEventLoop | None = None) -> None: ...
@@ -128,20 +98,26 @@ class StreamWriter:
         async def start_tls(
             self, sslcontext: ssl.SSLContext, *, server_hostname: str | None = None, ssl_handshake_timeout: float | None = None
         ) -> None: ...
-    if sys.version_info >= (3, 11):
+
+    if sys.version_info >= (3, 13):
+        def __del__(self, warnings: ModuleType = ...) -> None: ...
+    elif sys.version_info >= (3, 11):
         def __del__(self) -> None: ...
 
-class StreamReader(AsyncIterator[bytes]):
+class StreamReader:
     def __init__(self, limit: int = 65536, loop: events.AbstractEventLoop | None = None) -> None: ...
-    def exception(self) -> Exception: ...
+    def exception(self) -> Exception | None: ...
     def set_exception(self, exc: Exception) -> None: ...
     def set_transport(self, transport: transports.BaseTransport) -> None: ...
     def feed_eof(self) -> None: ...
     def at_eof(self) -> bool: ...
     def feed_data(self, data: Iterable[SupportsIndex]) -> None: ...
     async def readline(self) -> bytes: ...
-    # Can be any buffer that supports len(); consider changing to a Protocol if PEP 688 is accepted
-    async def readuntil(self, separator: bytes | bytearray | memoryview = b"\n") -> bytes: ...
+    if sys.version_info >= (3, 13):
+        async def readuntil(self, separator: _ReaduntilBuffer | tuple[_ReaduntilBuffer, ...] = b"\n") -> bytes: ...
+    else:
+        async def readuntil(self, separator: _ReaduntilBuffer = b"\n") -> bytes: ...
+
     async def read(self, n: int = -1) -> bytes: ...
     async def readexactly(self, n: int) -> bytes: ...
     def __aiter__(self) -> Self: ...

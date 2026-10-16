@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections import defaultdict
+
+import pytest
 
 from mypy import build
 from mypy.errors import CompileError
@@ -28,12 +31,17 @@ class GetDependenciesSuite(DataSuite):
         src = "\n".join(testcase.input)
         dump_all = "# __dump_all__" in src
         options = parse_options(src, testcase, incremental_step=1)
+        if options.python_version > sys.version_info:
+            pytest.skip("Test case requires a newer Python version")
         options.use_builtins_fixtures = True
         options.show_traceback = True
         options.cache_dir = os.devnull
         options.export_types = True
         options.preserve_asts = True
         options.allow_empty_bodies = True
+        if testcase.name.endswith("_old_parser"):
+            # This test is only for the old parser.
+            options.native_parser = False
         messages, files, type_map = self.build(src, options)
         a = messages
         if files is None or type_map is None:

@@ -66,12 +66,15 @@ from mypy.nodes import (
     StarExpr,
     StrExpr,
     SuperExpr,
+    TemplateStrExpr,
     TempNode,
     TryStmt,
     TupleExpr,
     TypeAliasExpr,
+    TypeAliasStmt,
     TypeApplication,
     TypedDictExpr,
+    TypeFormExpr,
     TypeVarExpr,
     TypeVarTupleExpr,
     UnaryExpr,
@@ -136,6 +139,7 @@ from mypyc.irbuild.statement import (
     transform_raise_stmt,
     transform_return_stmt,
     transform_try_stmt,
+    transform_type_alias_stmt,
     transform_while_stmt,
     transform_with_stmt,
     transform_yield_expr,
@@ -249,6 +253,9 @@ class IRBuilderVisitor(IRVisitor):
     def visit_match_stmt(self, stmt: MatchStmt) -> None:
         transform_match_stmt(self.builder, stmt)
 
+    def visit_type_alias_stmt(self, stmt: TypeAliasStmt) -> None:
+        transform_type_alias_stmt(self.builder, stmt)
+
     # Expressions
 
     def visit_name_expr(self, expr: NameExpr) -> Value:
@@ -304,6 +311,14 @@ class IRBuilderVisitor(IRVisitor):
 
     def visit_dict_expr(self, expr: DictExpr) -> Value:
         return transform_dict_expr(self.builder, expr)
+
+    def visit_template_str_expr(self, expr: TemplateStrExpr) -> Value:
+        if expr.has_surrogates:
+            self.builder.error(
+                "Surrogate codepoints in string literals not supported, use chr(...) instead",
+                expr.line,
+            )
+        self.bail("Template strings are not supported by mypyc", expr.line)
 
     def visit_set_expr(self, expr: SetExpr) -> Value:
         return transform_set_expr(self.builder, expr)
@@ -381,6 +396,9 @@ class IRBuilderVisitor(IRVisitor):
 
     def visit_cast_expr(self, o: CastExpr) -> Value:
         assert False, "CastExpr should have been handled in CallExpr"
+
+    def visit_type_form_expr(self, o: TypeFormExpr) -> Value:
+        assert False, "TypeFormExpr should have been handled in CallExpr"
 
     def visit_assert_type_expr(self, o: AssertTypeExpr) -> Value:
         assert False, "AssertTypeExpr should have been handled in CallExpr"

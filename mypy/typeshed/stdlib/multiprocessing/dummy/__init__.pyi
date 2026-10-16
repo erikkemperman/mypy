@@ -1,4 +1,5 @@
 import array
+import sys
 import threading
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -44,21 +45,32 @@ class DummyProcess(threading.Thread):
     _start_called: int
     @property
     def exitcode(self) -> Literal[0] | None: ...
-    def __init__(
-        self,
-        group: Any = None,
-        target: Callable[..., object] | None = None,
-        name: str | None = None,
-        args: Iterable[Any] = (),
-        kwargs: Mapping[str, Any] = {},
-    ) -> None: ...
+    if sys.version_info >= (3, 14):
+        # kwargs default changed in Python 3.14.1
+        def __init__(
+            self,
+            group: Any = None,
+            target: Callable[..., object] | None = None,
+            name: str | None = None,
+            args: Iterable[Any] = (),
+            kwargs: Mapping[str, Any] | None = None,
+        ) -> None: ...
+    else:
+        def __init__(
+            self,
+            group: Any = None,
+            target: Callable[..., object] | None = None,
+            name: str | None = None,
+            args: Iterable[Any] = (),
+            kwargs: Mapping[str, Any] | None = {},
+        ) -> None: ...
 
 Process = DummyProcess
 
 class Namespace:
     def __init__(self, **kwds: Any) -> None: ...
-    def __getattr__(self, __name: str) -> Any: ...
-    def __setattr__(self, __name: str, __value: Any) -> None: ...
+    def __getattr__(self, name: str, /) -> Any: ...
+    def __setattr__(self, name: str, value: Any, /) -> None: ...
 
 class Value:
     _typecode: Any

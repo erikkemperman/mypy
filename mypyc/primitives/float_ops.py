@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from mypyc.ir.ops import ERR_MAGIC, ERR_MAGIC_OVERLAPPING, ERR_NEVER
 from mypyc.ir.rtypes import (
+    bit_rprimitive,
     bool_rprimitive,
     float_rprimitive,
     int_rprimitive,
     object_rprimitive,
     str_rprimitive,
 )
-from mypyc.primitives.registry import binary_op, function_op, load_address_op
+from mypyc.primitives.registry import binary_op, custom_primitive_op, function_op, load_address_op
 
 # Get the 'builtins.float' type object.
 load_address_op(name="builtins.float", type=object_rprimitive, src="PyFloat_Type")
@@ -165,4 +166,49 @@ function_op(
     return_type=bool_rprimitive,
     c_function_name="CPyFloat_IsNaN",
     error_kind=ERR_NEVER,
+)
+
+# translate isinstance(obj, float)
+isinstance_float = function_op(
+    name="builtins.isinstance",
+    arg_types=[object_rprimitive],
+    return_type=bit_rprimitive,
+    c_function_name="PyFloat_Check",
+    error_kind=ERR_NEVER,
+)
+
+# obj.real, where obj is a float or a complex
+complex_real_op = custom_primitive_op(
+    name="complex.real",
+    arg_types=[object_rprimitive],
+    return_type=float_rprimitive,
+    c_function_name="CPyComplex_Real",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+# obj.imag, where obj is a float or a complex
+complex_imag_op = custom_primitive_op(
+    name="complex.imag",
+    arg_types=[object_rprimitive],
+    return_type=float_rprimitive,
+    c_function_name="CPyComplex_Imag",
+    error_kind=ERR_MAGIC_OVERLAPPING,
+)
+
+# obj.real, where obj is an int, a float or a complex (the result can be an int)
+number_real_op = custom_primitive_op(
+    name="number.real",
+    arg_types=[object_rprimitive],
+    return_type=object_rprimitive,
+    c_function_name="CPyNumber_Real",
+    error_kind=ERR_MAGIC,
+)
+
+# obj.imag, where obj is an int, a float or a complex (the result can be an int)
+number_imag_op = custom_primitive_op(
+    name="number.imag",
+    arg_types=[object_rprimitive],
+    return_type=object_rprimitive,
+    c_function_name="CPyNumber_Imag",
+    error_kind=ERR_MAGIC,
 )

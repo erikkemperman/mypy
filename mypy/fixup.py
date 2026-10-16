@@ -14,6 +14,7 @@ from mypy.nodes import (
     OverloadedFuncDef,
     ParamSpecExpr,
     SymbolTable,
+    SymbolTableNode,
     TypeAlias,
     TypeInfo,
     TypeVarExpr,
@@ -29,6 +30,7 @@ from mypy.types import (
     Overloaded,
     Parameters,
     ParamSpecType,
+    ProperType,
     TupleType,
     TypeAliasType,
     TypedDictType,
@@ -44,20 +46,14 @@ from mypy.types import (
 from mypy.visitor import NodeVisitor
 
 
-# N.B: we do a allow_missing fixup when fixing up a fine-grained
-# incremental cache load (since there may be cross-refs into deleted
-# modules)
-def fixup_module(tree: MypyFile, modules: dict[str, MypyFile], allow_missing: bool) -> None:
-    node_fixer = NodeFixer(modules, allow_missing)
-    node_fixer.visit_symbol_table(tree.names, tree.fullname)
-
-
-# TODO: Fix up .info when deserializing, i.e. much earlier.
 class NodeFixer(NodeVisitor[None]):
     current_info: TypeInfo | None = None
 
     def __init__(self, modules: dict[str, MypyFile], allow_missing: bool) -> None:
         self.modules = modules
+        # N.B: we do an allow_missing fixup when fixing up a fine-grained
+        # incremental cache load (since there may be cross-refs into deleted
+        # modules)
         self.allow_missing = allow_missing
         self.type_fixer = TypeFixer(self.modules, allow_missing)
 
@@ -69,7 +65,7 @@ class NodeFixer(NodeVisitor[None]):
             if info.defn:
                 info.defn.accept(self)
             if info.names:
-                self.visit_symbol_table(info.names, info.fullname)
+                self.visit_symbol_table(info.names)
             if info.bases:
                 for base in info.bases:
                     base.accept(self.type_fixer)
@@ -96,6 +92,8 @@ class NodeFixer(NodeVisitor[None]):
                 info.declared_metaclass.accept(self.type_fixer)
             if info.metaclass_type:
                 info.metaclass_type.accept(self.type_fixer)
+            if info.self_type:
+                info.self_type.accept(self.type_fixer)
             if info.alt_promote:
                 info.alt_promote.accept(self.type_fixer)
                 instance = Instance(info, [])
@@ -115,75 +113,85 @@ class NodeFixer(NodeVisitor[None]):
             self.current_info = save_info
 
     # NOTE: This method *definitely* isn't part of the NodeVisitor API.
-    def visit_symbol_table(self, symtab: SymbolTable, table_fullname: str) -> None:
-        # Copy the items because we may mutate symtab.
-        for key, value in list(symtab.items()):
+    def visit_symbol_table(self, symtab: SymbolTable) -> None:
+        for key in symtab:
+            value = symtab[key]
             cross_ref = value.cross_ref
-            if cross_ref is not None:  # Fix up cross-reference.
-                value.cross_ref = None
+            # Fix up module cross-reference eagerly because it is very cheap.
+            if cross_ref is not None:
                 if cross_ref in self.modules:
-                    value.node = self.modules[cross_ref]
-                else:
-                    stnode = lookup_fully_qualified(
-                        cross_ref, self.modules, raise_on_missing=not self.allow_missing
-                    )
-                    if stnode is not None:
-                        if stnode is value:
-                            # The node seems to refer to itself, which can mean that
-                            # the target is a deleted submodule of the current module,
-                            # and thus lookup falls back to the symbol table of the parent
-                            # package. Here's how this may happen:
-                            #
-                            #   pkg/__init__.py:
-                            #     from pkg import sub
-                            #
-                            # Now if pkg.sub is deleted, the pkg.sub symbol table entry
-                            # appears to refer to itself. Replace the entry with a
-                            # placeholder to avoid a crash. We can't delete the entry,
-                            # as it would stop dependency propagation.
-                            value.node = Var(key + "@deleted")
-                        else:
-                            assert stnode.node is not None, (table_fullname + "." + key, cross_ref)
-                            value.node = stnode.node
-                    elif not self.allow_missing:
-                        assert False, f"Could not find cross-ref {cross_ref}"
-                    else:
-                        # We have a missing crossref in allow missing mode, need to put something
-                        value.node = missing_info(self.modules)
+                    value.cross_ref = None
+                    value.unfixed = False
+                    value._node = self.modules[cross_ref]
+                # TODO: this should not be needed, looks like a daemon bug.
+                elif self.allow_missing:
+                    self.resolve_cross_ref(value)
+            # Look at private attribute to avoid triggering fixup eagerly.
+            elif isinstance(value._node, TypeInfo):
+                self.visit_type_info(value._node)
             else:
-                if isinstance(value.node, TypeInfo):
-                    # TypeInfo has no accept().  TODO: Add it?
-                    self.visit_type_info(value.node)
-                elif value.node is not None:
-                    value.node.accept(self)
-                else:
-                    assert False, f"Unexpected empty node {key!r}: {value}"
+                value.stored_info = self.current_info
+
+    def resolve_cross_ref(self, value: SymbolTableNode) -> None:
+        """Replace cross-reference with an actual referred node."""
+        assert value.cross_ref is not None
+        cross_ref = value.cross_ref
+        value.cross_ref = None
+        value.unfixed = False
+        stnode = lookup_fully_qualified(
+            cross_ref, self.modules, raise_on_missing=not self.allow_missing
+        )
+        if stnode is not None:
+            if stnode is value:
+                # The node seems to refer to itself, which can mean that
+                # the target is a deleted submodule of the current module,
+                # and thus lookup falls back to the symbol table of the parent
+                # package. Here's how this may happen:
+                #
+                #   pkg/__init__.py:
+                #     from pkg import sub
+                #
+                # Now if pkg.sub is deleted, the pkg.sub symbol table entry
+                # appears to refer to itself. Replace the entry with a
+                # placeholder to avoid a crash. We can't delete the entry,
+                # as it would stop dependency propagation.
+                short_name = cross_ref.rsplit(".", maxsplit=1)[-1]
+                value._node = Var(short_name + "@deleted")
+            else:
+                assert stnode.node is not None, cross_ref
+                value._node = stnode.node
+        elif not self.allow_missing:
+            assert False, f"Could not find cross-ref {cross_ref}"
+        else:
+            # We have a missing crossref in allow missing mode, need to put something
+            value._node = missing_info(self.modules)
 
     def visit_func_def(self, func: FuncDef) -> None:
-        if self.current_info is not None:
-            func.info = self.current_info
         if func.type is not None:
             func.type.accept(self.type_fixer)
+            if isinstance(func.type, CallableType):
+                func.type.definition = func
 
     def visit_overloaded_func_def(self, o: OverloadedFuncDef) -> None:
-        if self.current_info is not None:
-            o.info = self.current_info
         if o.type:
             o.type.accept(self.type_fixer)
         for item in o.items:
             item.accept(self)
         if o.impl:
             o.impl.accept(self)
+        if isinstance(o.type, Overloaded):
+            # For error messages we link the original definition for each item.
+            for typ, item in zip(o.type.items, o.items):
+                typ.definition = item
 
     def visit_decorator(self, d: Decorator) -> None:
-        if self.current_info is not None:
-            d.var.info = self.current_info
         if d.func:
             d.func.accept(self)
         if d.var:
             d.var.accept(self)
-        for node in d.decorators:
-            node.accept(self)
+        typ = d.var.type
+        if isinstance(typ, ProperType) and isinstance(typ, CallableType):
+            typ.definition = d.func
 
     def visit_class_def(self, c: ClassDef) -> None:
         for v in c.type_vars:
@@ -205,10 +213,10 @@ class NodeFixer(NodeVisitor[None]):
         tv.default.accept(self.type_fixer)
 
     def visit_var(self, v: Var) -> None:
-        if self.current_info is not None:
-            v.info = self.current_info
         if v.type is not None:
             v.type.accept(self.type_fixer)
+        if v.setter_type is not None:
+            v.setter_type.accept(self.type_fixer)
 
     def visit_type_alias(self, a: TypeAlias) -> None:
         a.target.accept(self.type_fixer)
@@ -222,7 +230,6 @@ class TypeFixer(TypeVisitor[None]):
         self.allow_missing = allow_missing
 
     def visit_instance(self, inst: Instance) -> None:
-        # TODO: Combine Instances that are exactly the same?
         type_ref = inst.type_ref
         if type_ref is None:
             return  # We've already been here.
@@ -239,6 +246,9 @@ class TypeFixer(TypeVisitor[None]):
             a.accept(self)
         if inst.last_known_value is not None:
             inst.last_known_value.accept(self)
+        if inst.extra_attrs:
+            for v in inst.extra_attrs.attrs.values():
+                v.accept(self)
 
     def visit_type_alias_type(self, t: TypeAliasType) -> None:
         type_ref = t.type_ref
@@ -265,11 +275,12 @@ class TypeFixer(TypeVisitor[None]):
             ct.ret_type.accept(self)
         for v in ct.variables:
             v.accept(self)
-        for arg in ct.bound_args:
-            if arg:
-                arg.accept(self)
         if ct.type_guard is not None:
             ct.type_guard.accept(self)
+        if ct.type_is is not None:
+            ct.type_is.accept(self)
+        if ct.instance_type is not None:
+            ct.instance_type.accept(self)
 
     def visit_overloaded(self, t: Overloaded) -> None:
         for ct in t.items:
@@ -330,6 +341,7 @@ class TypeFixer(TypeVisitor[None]):
     def visit_param_spec(self, p: ParamSpecType) -> None:
         p.upper_bound.accept(self)
         p.default.accept(self)
+        p.prefix.accept(self)
 
     def visit_type_var_tuple(self, t: TypeVarTupleType) -> None:
         t.tuple_fallback.accept(self)
@@ -423,4 +435,4 @@ def missing_info(modules: dict[str, MypyFile]) -> TypeInfo:
 
 def missing_alias() -> TypeAlias:
     suggestion = _SUGGESTION.format("alias")
-    return TypeAlias(AnyType(TypeOfAny.special_form), suggestion, line=-1, column=-1)
+    return TypeAlias(AnyType(TypeOfAny.special_form), suggestion, "<missing>", line=-1, column=-1)

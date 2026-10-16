@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import unittest
 from typing import Any
 
@@ -43,6 +44,8 @@ from mypy.test.helpers import (
 )
 
 # Set to True to perform (somewhat expensive) checks for duplicate AST nodes after merge
+from mypy.test.update_data import update_testcase_output
+
 CHECK_CONSISTENCY = False
 
 
@@ -74,7 +77,6 @@ class FineGrainedSuite(DataSuite):
     def run_case(self, testcase: DataDrivenTestCase) -> None:
         if self.should_skip(testcase):
             pytest.skip()
-            return
 
         main_src = "\n".join(testcase.input)
         main_path = os.path.join(test_temp_dir, "main")
@@ -82,6 +84,9 @@ class FineGrainedSuite(DataSuite):
             f.write(main_src)
 
         options = self.get_options(main_src, testcase, build_cache=False)
+        if options.python_version > sys.version_info:
+            pytest.skip("Test case requires a newer Python version")
+
         build_options = self.get_options(main_src, testcase, build_cache=True)
         server = Server(options, DEFAULT_STATUS_FILE)
 
@@ -97,8 +102,8 @@ class FineGrainedSuite(DataSuite):
         if messages:
             a.extend(normalize_messages(messages))
 
-        assert testcase.tmpdir
-        a.extend(self.maybe_suggest(step, server, main_src, testcase.tmpdir.name))
+        assert testcase.tmpdir is not None
+        a.extend(self.maybe_suggest(step, server, main_src, testcase.tmpdir))
         a.extend(self.maybe_inspect(step, server, main_src))
 
         if server.fine_grained_manager:
@@ -127,6 +132,10 @@ class FineGrainedSuite(DataSuite):
         # Normalize paths in test output (for Windows).
         a = [line.replace("\\", "/") for line in a]
 
+        # This may not work perfectly, since it was designed for testcheck.py, use with care.
+        if testcase.output != a and testcase.config.getoption("--update-data", False):
+            update_testcase_output(testcase, a, incremental_step=1)
+
         assert_string_arrays_equal(
             testcase.output, a, f"Invalid output ({testcase.file}, line {testcase.line})"
         )
@@ -152,6 +161,12 @@ class FineGrainedSuite(DataSuite):
         options.export_types = "inspect" in testcase.file
         # Treat empty bodies safely for these test cases.
         options.allow_empty_bodies = not testcase.name.endswith("_no_empty")
+
+        if testcase.name.endswith("_old_parser") or testcase.name.endswith("_old_parser_cached"):
+            # This test is only for the old parser.
+            options.native_parser = False
+
+        options.reveal_verbose_types = True
         if re.search("flags:.*--follow-imports", source) is None:
             # Override the default for follow_imports
             options.follow_imports = "error"
@@ -244,8 +259,8 @@ class FineGrainedSuite(DataSuite):
         new_messages = normalize_messages(new_messages)
 
         a = new_messages
-        assert testcase.tmpdir
-        a.extend(self.maybe_suggest(step, server, main_src, testcase.tmpdir.name))
+        assert testcase.tmpdir is not None
+        a.extend(self.maybe_suggest(step, server, main_src, testcase.tmpdir))
         a.extend(self.maybe_inspect(step, server, main_src))
 
         return a, triggered

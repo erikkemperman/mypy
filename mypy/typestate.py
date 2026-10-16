@@ -5,26 +5,25 @@ and potentially other mutable TypeInfo state. This module contains mutable globa
 
 from __future__ import annotations
 
-from typing import Dict, Final, Set, Tuple
-from typing_extensions import TypeAlias as _TypeAlias
+from typing import Final, TypeAlias as _TypeAlias
 
-from mypy.nodes import TypeInfo
+from mypy.nodes import VARIANCE_NOT_READY, TypeInfo
 from mypy.server.trigger import make_trigger
-from mypy.types import Instance, Type, TypeVarId, get_proper_type
+from mypy.types import Instance, Type, TypeVarId, TypeVarType, get_proper_type
 
 MAX_NEGATIVE_CACHE_TYPES: Final = 1000
 MAX_NEGATIVE_CACHE_ENTRIES: Final = 10000
 
 # Represents that the 'left' instance is a subtype of the 'right' instance
-SubtypeRelationship: _TypeAlias = Tuple[Instance, Instance]
+SubtypeRelationship: _TypeAlias = tuple[Instance, Instance]
 
 # A tuple encoding the specific conditions under which we performed the subtype check.
 # (e.g. did we want a proper subtype? A regular subtype while ignoring variance?)
-SubtypeKind: _TypeAlias = Tuple[bool, ...]
+SubtypeKind: _TypeAlias = tuple[bool, ...]
 
 # A cache that keeps track of whether the given TypeInfo is a part of a particular
 # subtype relationship
-SubtypeCache: _TypeAlias = Dict[TypeInfo, Dict[SubtypeKind, Set[SubtypeRelationship]]]
+SubtypeCache: _TypeAlias = dict[TypeInfo, dict[SubtypeKind, set[SubtypeRelationship]]]
 
 
 class TypeState:
@@ -96,8 +95,13 @@ class TypeState:
     # Whether to use new type inference algorithm that can infer polymorphic types.
     # This is temporary and will be removed soon when new algorithm is more polished.
     infer_polymorphic: bool
+    # No not simplify/normalize unions during type inference in this flag is set.
+    # Technically, union simplification gives strictly better type inference, but it
+    # may have bad performance (since it is quadratic). So we may want to disable
+    # it situations where performance is important.
+    keep_unions: bool
 
-    # N.B: We do all of the accesses to these properties through
+    # N.B: We do all the accesses to these properties through
     # TypeState, instead of making these classmethods and accessing
     # via the cls parameter, since mypyc can optimize accesses to
     # Final attributes of a directly referenced type.
@@ -114,6 +118,7 @@ class TypeState:
         self.inferring = []
         self.infer_unions = False
         self.infer_polymorphic = False
+        self.keep_unions = False
 
     def is_assumed_subtype(self, left: Type, right: Type) -> bool:
         for l, r in reversed(self._assuming):
@@ -191,6 +196,12 @@ class TypeState:
         if left.last_known_value is not None or right.last_known_value is not None:
             # These are unlikely to match, due to the large space of
             # possible values.  Avoid uselessly increasing cache sizes.
+            return
+        if any(
+            (isinstance(tv, TypeVarType) and tv.variance == VARIANCE_NOT_READY)
+            for tv in right.type.defn.type_vars
+        ):
+            # Variance indeterminate -- don't know the result
             return
         cache = self._subtype_caches.setdefault(right.type, {})
         cache.setdefault(kind, set()).add((left, right))

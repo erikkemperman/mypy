@@ -6,13 +6,15 @@ The public interface is via the mypy.stubgen module.
 
 from __future__ import annotations
 
+import enum
 import glob
 import importlib
 import inspect
 import keyword
 import os.path
+from collections.abc import Callable, Mapping
 from types import FunctionType, ModuleType
-from typing import Any, Mapping
+from typing import Any
 
 from mypy.fastparse import parse_type_comment
 from mypy.moduleinspect import is_c_module
@@ -36,6 +38,7 @@ from mypy.stubutil import (
     infer_method_arg_types,
     infer_method_ret_type,
 )
+from mypy.util import quote_docstring
 
 
 class ExternalSignatureGenerator(SignatureGenerator):
@@ -178,7 +181,7 @@ def generate_stub_for_c_module(
     gen.generate_module()
     output = gen.output()
 
-    with open(target, "w") as file:
+    with open(target, "w", encoding="utf-8") as file:
         file.write(output)
 
 
@@ -202,12 +205,24 @@ class CFunctionStub:
             sigs[0].name, "\n".join(sig.format_sig()[:-4] for sig in sigs), is_abstract
         )
 
-    def __get__(self) -> None:
+    def __get__(self) -> None:  # noqa: PLE0302
         """
         This exists to make this object look like a method descriptor and thus
         return true for CStubGenerator.ismethod()
         """
         pass
+
+
+_Missing = enum.Enum("_Missing", "VALUE")
+
+
+def _is_sentinel_object(obj: object) -> bool:
+    """Whether obj is a sentinel object."""
+    typ = type(obj)
+    return typ.__module__ in ("builtins", "typing_extensions") and typ.__name__ in (
+        "sentinel",  # 4.16+
+        "Sentinel",  # 4.14 - 4.15
+    )
 
 
 class InspectionStubGenerator(BaseStubGenerator):
@@ -241,7 +256,7 @@ class InspectionStubGenerator(BaseStubGenerator):
         self.module_name = module_name
         if self.is_c_module:
             # Add additional implicit imports.
-            # C-extensions are given more lattitude since they do not import the typing module.
+            # C-extensions are given more latitude since they do not import the typing module.
             self.known_imports.update(
                 {
                     "typing": [
@@ -252,6 +267,7 @@ class InspectionStubGenerator(BaseStubGenerator):
                         "Iterable",
                         "Iterator",
                         "List",
+                        "Literal",
                         "NamedTuple",
                         "Optional",
                         "Tuple",
@@ -291,6 +307,8 @@ class InspectionStubGenerator(BaseStubGenerator):
         varargs = argspec.varargs
         kwargs = argspec.varkw
         annotations = argspec.annotations
+        kwonlyargs = argspec.kwonlyargs
+        kwonlydefaults = argspec.kwonlydefaults
 
         def get_annotation(key: str) -> str | None:
             if key not in annotations:
@@ -303,27 +321,57 @@ class InspectionStubGenerator(BaseStubGenerator):
             return argtype
 
         arglist: list[ArgSig] = []
+
         # Add the arguments to the signature
-        for i, arg in enumerate(args):
-            # Check if the argument has a default value
-            if defaults and i >= len(args) - len(defaults):
-                default_value = defaults[i - (len(args) - len(defaults))]
-                if arg in annotations:
-                    argtype = annotations[arg]
-                else:
-                    argtype = self.get_type_annotation(default_value)
-                    if argtype == "None":
-                        # None is not a useful annotation, but we can infer that the arg
-                        # is optional
+        def add_args(
+            args: list[str], get_default_value: Callable[[int, str], object | _Missing]
+        ) -> None:
+            for i, arg in enumerate(args):
+                # Check if the argument has a default value
+                default_value = get_default_value(i, arg)
+                if default_value is not _Missing.VALUE:
+                    if arg in annotations:
+                        argtype = get_annotation(arg)
+                    elif _is_sentinel_object(default_value):
+                        # Reference the sentinel itself by name when possible, e.g.
+                        # `Incomplete | _MISSING`.
                         incomplete = self.add_name("_typeshed.Incomplete")
-                        argtype = f"{incomplete} | None"
-                arglist.append(ArgSig(arg, argtype, default=True))
+                        ref = self._sentinel_type_ref(default_value)
+                        argtype = f"{incomplete} | {ref}" if ref else incomplete
+                    else:
+                        argtype = self.get_type_annotation(default_value)
+                        if argtype == "None":
+                            # None is not a useful annotation, but we can infer that the arg
+                            # is optional
+                            incomplete = self.add_name("_typeshed.Incomplete")
+                            argtype = f"{incomplete} | None"
+
+                    arglist.append(ArgSig(arg, argtype, default=True))
+                else:
+                    arglist.append(ArgSig(arg, get_annotation(arg), default=False))
+
+        def get_pos_default(i: int, _arg: str) -> Any | _Missing:
+            if defaults and i >= len(args) - len(defaults):
+                return defaults[i - (len(args) - len(defaults))]
             else:
-                arglist.append(ArgSig(arg, get_annotation(arg), default=False))
+                return _Missing.VALUE
+
+        add_args(args, get_pos_default)
 
         # Add *args if present
         if varargs:
             arglist.append(ArgSig(f"*{varargs}", get_annotation(varargs)))
+        # if we have keyword only args, then we need to add "*"
+        elif kwonlyargs:
+            arglist.append(ArgSig("*"))
+
+        def get_kw_default(_i: int, arg: str) -> Any | _Missing:
+            if kwonlydefaults and arg in kwonlydefaults:
+                return kwonlydefaults[arg]
+            else:
+                return _Missing.VALUE
+
+        add_args(kwonlyargs, get_kw_default)
 
         # Add **kwargs if present
         if kwargs:
@@ -466,6 +514,9 @@ class InspectionStubGenerator(BaseStubGenerator):
                 "__module__",
                 "__weakref__",
                 "__annotations__",
+                "__firstlineno__",
+                "__static_attributes__",
+                "__annotate__",
             )
             or attr in self.IGNORED_DUNDERS
             or is_pybind_skipped_attribute(attr)  # For pickling
@@ -495,13 +546,31 @@ class InspectionStubGenerator(BaseStubGenerator):
         if obj is None or obj is type(None):
             return "None"
         elif inspect.isclass(obj):
-            return "type[{}]".format(self.get_type_fullname(obj))
+            return f"type[{self.get_type_fullname(obj)}]"
         elif isinstance(obj, FunctionType):
             return self.add_name("typing.Callable")
         elif isinstance(obj, ModuleType):
             return self.add_name("types.ModuleType", require=False)
+        elif _is_sentinel_object(obj):
+            # Works across all supported Python versions
+            return "typing_extensions.sentinel"
         else:
             return self.get_type_fullname(type(obj))
+
+    def _sentinel_type_ref(self, sentinel_obj: object) -> str | None:
+        """Return a reference to the name a sentinel object is bound to.
+
+        The sentinel spec says __name__ and __module__ are always present,
+        typing-extensions 4.16+ implements these, and stubs always use the
+        latest typing-extensions.
+
+        - https://docs.python.org/3.15/builtins/functions.html#sentinel.__name__
+        - https://docs.python.org/3.15/builtins/functions.html#sentinel.__module__
+        """
+        if (name := getattr(sentinel_obj, "__name__", None)) and name.isidentifier():
+            return f"{sentinel_obj.__module__}.{name}"
+
+        return None
 
     def is_function(self, obj: object) -> bool:
         if self.is_c_module:
@@ -614,8 +683,7 @@ class InspectionStubGenerator(BaseStubGenerator):
                 if inferred[0].args and inferred[0].args[0].name == "cls":
                     decorators.append("@classmethod")
 
-        if docstring:
-            docstring = self._indent_docstring(docstring)
+        docstring = self._indent_docstring(ctx.docstring) if ctx.docstring else None
         output.extend(self.format_func_def(inferred, decorators=decorators, docstring=docstring))
         self._fix_iter(ctx, inferred, output)
 
@@ -719,9 +787,14 @@ class InspectionStubGenerator(BaseStubGenerator):
             )
         else:  # regular property
             if readonly:
+                docstring = self._indent_docstring(ctx.docstring) if ctx.docstring else None
                 ro_properties.append(f"{self._indent}@property")
-                sig = FunctionSig(name, [ArgSig("self")], inferred_type)
-                ro_properties.append(sig.format_sig(indent=self._indent))
+                sig = FunctionSig(name, [ArgSig("self")], inferred_type, docstring=docstring)
+                ro_properties.append(
+                    sig.format_sig(
+                        indent=self._indent, include_docstrings=self._include_docstrings
+                    )
+                )
             else:
                 if inferred_type is None:
                     inferred_type = self.add_name("_typeshed.Incomplete")
@@ -734,7 +807,11 @@ class InspectionStubGenerator(BaseStubGenerator):
             return "Any"
         typename = getattr(typ, "__qualname__", typ.__name__)
         module_name = self.get_obj_module(typ)
-        assert module_name is not None, typ
+        if module_name is None:
+            # This should not normally happen, but some types may resist our
+            # introspection attempts too hard. See
+            # https://github.com/python/mypy/issues/19031
+            return "_typeshed.Incomplete"
         if module_name != "builtins":
             typename = f"{module_name}.{typename}"
         return typename
@@ -757,7 +834,9 @@ class InspectionStubGenerator(BaseStubGenerator):
                 bases.append(base)
         return [self.strip_or_import(self.get_type_fullname(base)) for base in bases]
 
-    def generate_class_stub(self, class_name: str, cls: type, output: list[str]) -> None:
+    def generate_class_stub(
+        self, class_name: str, cls: type, output: list[str], parent_class: ClassInfo | None = None
+    ) -> None:
         """Generate stub for a single class using runtime introspection.
 
         The result lines will be appended to 'output'. If necessary, any
@@ -778,7 +857,9 @@ class InspectionStubGenerator(BaseStubGenerator):
         self.record_name(class_name)
         self.indent()
 
-        class_info = ClassInfo(class_name, "", getattr(cls, "__doc__", None), cls)
+        class_info = ClassInfo(
+            class_name, "", getattr(cls, "__doc__", None), cls, parent=parent_class
+        )
 
         for attr, value in items:
             # use unevaluated descriptors when dealing with property inspection
@@ -813,7 +894,7 @@ class InspectionStubGenerator(BaseStubGenerator):
                     class_info,
                 )
             elif inspect.isclass(value) and self.is_defined_in_module(value):
-                self.generate_class_stub(attr, value, types)
+                self.generate_class_stub(attr, value, types, parent_class=class_info)
             else:
                 attrs.append((attr, value))
 
@@ -832,8 +913,17 @@ class InspectionStubGenerator(BaseStubGenerator):
             bases_str = "(%s)" % ", ".join(bases)
         else:
             bases_str = ""
-        if types or static_properties or rw_properties or methods or ro_properties:
+
+        if class_info.docstring and self._include_docstrings:
+            doc = quote_docstring(self._indent_docstring(class_info.docstring))
+            doc = f"    {self._indent}{doc}"
+            docstring = doc.splitlines(keepends=False)
+        else:
+            docstring = []
+
+        if docstring or types or static_properties or rw_properties or methods or ro_properties:
             output.append(f"{self._indent}class {class_name}{bases_str}:")
+            output.extend(docstring)
             for line in types:
                 if (
                     output
@@ -843,14 +933,10 @@ class InspectionStubGenerator(BaseStubGenerator):
                 ):
                     output.append("")
                 output.append(line)
-            for line in static_properties:
-                output.append(line)
-            for line in rw_properties:
-                output.append(line)
-            for line in methods:
-                output.append(line)
-            for line in ro_properties:
-                output.append(line)
+            output.extend(static_properties)
+            output.extend(rw_properties)
+            output.extend(methods)
+            output.extend(ro_properties)
         else:
             output.append(f"{self._indent}class {class_name}{bases_str}: ...")
 
@@ -860,6 +946,12 @@ class InspectionStubGenerator(BaseStubGenerator):
         The result lines will be appended to 'output'. If necessary, any
         required names will be added to 'imports'.
         """
+        # A sentinel's name is emitted regardless of privacy/`__all__`.
+        if _is_sentinel_object(obj):
+            self.record_name(name)
+            self.add_import_line("import typing_extensions\n")
+            output.append(f"{name} = typing_extensions.sentinel('{name}')")
+            return
         if self.is_private_name(name, f"{self.module_name}.{name}") or self.is_not_in_all(name):
             return
         self.record_name(name)

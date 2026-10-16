@@ -1,4 +1,5 @@
 [case testI64BasicOps]
+import sys
 from typing import List, Any, Tuple, Union
 
 from mypy_extensions import i64, i32, i16
@@ -299,11 +300,11 @@ def test_explicit_conversion_overflow() -> None:
     assert int(y) == min_i64
 
     too_big = int() + 2**63
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         x = i64(too_big)
 
     too_small = int() - 2**63 - 1
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         x = i64(too_small)
 
 def test_i64_from_large_small_literal() -> None:
@@ -323,9 +324,9 @@ def test_explicit_conversion_from_float() -> None:
     assert from_float(2**63 - 1024) == 2**63 - 1024
     assert from_float(-2**63) == -2**63
     # The error message could be better, but this is acceptable
-    with assertRaises(OverflowError, "int too large to convert to i64"):
+    with assertRaises(ValueError, "int too large to convert to i64"):
         assert from_float(float(2**63))
-    with assertRaises(OverflowError, "int too large to convert to i64"):
+    with assertRaises(ValueError, "int too large to convert to i64"):
         # One ulp below the lowest valid i64 value
         from_float(float(-2**63 - 2048))
 
@@ -386,6 +387,47 @@ def test_tuple_i64() -> None:
     tt: Tuple[i64, i64] = x
     assert tt == (1, 2)
 
+def as_mixed_i64_tuple(value: Any) -> tuple[str, i64]:
+    return value
+
+def as_i64_pair(value: Any) -> tuple[i64, i64]:
+    return value
+
+def as_nested_i64_tuple(value: Any) -> tuple[str, tuple[i64, i64]]:
+    return value
+
+def as_ref_i64_ref_tuple(value: Any) -> tuple[object, i64, object]:
+    return value
+
+def accept_ref_i64_ref_tuple(value: tuple[object, i64, object]) -> None:
+    pass
+
+def test_tuple_i64_unbox_error() -> None:
+    too_large = 1 << 63
+    message = "int too large to convert to i64"
+    with assertRaises(ValueError, message):
+        as_mixed_i64_tuple(("x", too_large))
+    with assertRaises(ValueError, message):
+        as_i64_pair((0, too_large))
+    with assertRaises(ValueError, message):
+        as_nested_i64_tuple(("x", (0, too_large)))
+
+    getrefcount: Any = getattr(sys, "getrefcount")
+    first = object()
+    last = object()
+    first_refcount = getrefcount(first)
+    last_refcount = getrefcount(last)
+    with assertRaises(ValueError, message):
+        as_ref_i64_ref_tuple((first, too_large, last))
+    assert getrefcount(first) == first_refcount
+    assert getrefcount(last) == last_refcount
+
+    dynamic_accept: Any = accept_ref_i64_ref_tuple
+    with assertRaises(TypeError):
+        dynamic_accept((first, too_large, last))
+    assert getrefcount(first) == first_refcount
+    assert getrefcount(last) == last_refcount
+
 def test_list_set_item() -> None:
     a: List[i64] = [0, 2, 6]
     z: i64 = int()
@@ -430,13 +472,13 @@ def test_mixed_comparisons() -> None:
 
     int_too_big = int() + (1 << 63)
     int_too_small = int() - (1 << 63) - 1
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert i64_3 < int_too_big
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert int_too_big < i64_3
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert i64_3 > int_too_small
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert int_too_small < i64_3
 
 def test_mixed_comparisons_32bit() -> None:
@@ -476,9 +518,9 @@ def test_mixed_arithmetic_and_bitwise_ops() -> None:
 
     int_too_big = int() + (1 << 63)
     int_too_small = int() - (1 << 63) - 1
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert i64_3 & int_too_big
-    with assertRaises(OverflowError):
+    with assertRaises(ValueError):
         assert int_too_small & i64_3
 
 def test_for_loop() -> None:
@@ -517,11 +559,10 @@ def test_isinstance() -> None:
     assert narrow2("foobar") == 6
 
 [case testI64ErrorValuesAndUndefined]
-from typing import Any, Tuple
+from typing import Any, Final, Tuple
 import sys
 
 from mypy_extensions import mypyc_attr, i64
-from typing_extensions import Final
 
 from testutil import assertRaises
 
@@ -592,10 +633,10 @@ def test_unbox_int_fails() -> None:
     with assertRaises(TypeError, msg):
         x: i64 = o
     o2: Any = 1 << 63
-    with assertRaises(OverflowError, "int too large to convert to i64"):
+    with assertRaises(ValueError, "int too large to convert to i64"):
         y: i64 = o2
     o3: Any = -(1 << 63 + 1)
-    with assertRaises(OverflowError, "int too large to convert to i64"):
+    with assertRaises(ValueError, "int too large to convert to i64"):
         z: i64 = o3
 
 class Uninit:
@@ -905,8 +946,7 @@ def test_undefined_native_int_tuple_via_any() -> None:
     assert o.t == (-13, 45)
 
 [case testI64DefaultArgValues]
-from typing import Any, Iterator, Tuple
-from typing_extensions import Final
+from typing import Any, Final, Iterator, Tuple
 
 MAGIC: Final = -113
 
@@ -1206,7 +1246,7 @@ def test_magic_default() -> None:
     assert a(MAGIC) == MAGIC
 
 [case testI64UndefinedLocal]
-from typing_extensions import Final
+from typing import Final
 
 from mypy_extensions import i64, i32
 
@@ -1307,28 +1347,28 @@ def test_many_locals() -> None:
         a31: i64 = 31
         a32: i64 = 32
         a33: i64 = 33
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a0)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a31)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a32)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a33)
     a0 = 5
     assert a0 == 5
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a31)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a32)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a33)
     a32 = 55
     assert a0 == 5
     assert a32 == 55
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a31)
-    with assertRaises(NameError):
+    with assertRaises(UnboundLocalError):
         print(a33)
     a31 = 10
     a33 = 20
@@ -1338,8 +1378,7 @@ def test_many_locals() -> None:
     assert a33 == 20
 
 [case testI64GlueMethodsAndInheritance]
-from typing import Any
-from typing_extensions import Final
+from typing import Final, Any
 
 from mypy_extensions import i64, trait
 
@@ -1517,3 +1556,28 @@ def test_dunder_arg_check() -> None:
         2**63 in o
     with assertRaises(IndexError):
         1 in o
+
+[case testI64DefinednessAcrossYield]
+from typing import Final, Iterator
+
+from mypy_extensions import i64
+from testutil import assertRaises
+
+MAGIC: Final = -113
+
+def error_value() -> Iterator[i64]:
+    value: i64 = MAGIC
+    yield 0
+    yield value
+
+def conditional(define: bool) -> Iterator[i64]:
+    if define:
+        value: i64 = 5
+    yield 0
+    yield value
+
+def test_i64_definedness_across_yield() -> None:
+    assert list(error_value()) == [0, MAGIC]
+    assert list(conditional(True)) == [0, 5]
+    with assertRaises(AttributeError):
+        list(conditional(False))

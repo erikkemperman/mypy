@@ -22,10 +22,11 @@ below, mypyc.irbuild.builder, and mypyc.irbuild.visitor.
 
 from __future__ import annotations
 
-from typing import Any, Callable, TypeVar, cast
+from collections.abc import Callable
+from typing import Any, TypeVar, cast
 
 from mypy.build import Graph
-from mypy.nodes import ClassDef, Expression, MypyFile
+from mypy.nodes import ClassDef, Expression, FuncDef, MypyFile
 from mypy.state import state
 from mypy.types import Type
 from mypyc.analysis.attrdefined import analyze_always_defined_attrs
@@ -37,10 +38,16 @@ from mypyc.ir.rtypes import none_rprimitive
 from mypyc.irbuild.builder import IRBuilder
 from mypyc.irbuild.mapper import Mapper
 from mypyc.irbuild.prebuildvisitor import PreBuildVisitor
-from mypyc.irbuild.prepare import build_type_map, find_singledispatch_register_impls
+from mypyc.irbuild.prepare import (
+    adjust_generator_classes_of_methods,
+    build_type_map,
+    create_generator_class_for_func,
+    find_singledispatch_register_impls,
+)
 from mypyc.irbuild.visitor import IRBuilderVisitor
 from mypyc.irbuild.vtable import compute_vtable
 from mypyc.options import CompilerOptions
+from mypyc.transform.generator_spills import promote_generator_registers
 
 # The stubs for callable contextmanagers are busted so cast it to the
 # right type...
@@ -64,17 +71,30 @@ def build_ir(
     """
 
     build_type_map(mapper, modules, graph, types, options, errors)
+    adjust_generator_classes_of_methods(mapper)
     singledispatch_info = find_singledispatch_register_impls(modules, errors)
 
     result: ModuleIRs = {}
+    if errors.num_errors > 0:
+        return result
 
     # Generate IR for all modules.
     class_irs = []
 
     for module in modules:
         # First pass to determine free symbols.
-        pbv = PreBuildVisitor(errors, module, singledispatch_info.decorators_to_remove)
+        pbv = PreBuildVisitor(errors, module, singledispatch_info.decorators_to_remove, types)
         module.accept(pbv)
+
+        # Declare generator classes for nested async functions and generators.
+        for fdef in pbv.nested_funcs:
+            if isinstance(fdef, FuncDef):
+                # Make generator class name sufficiently unique.
+                suffix = f"___{fdef.line}"
+                if fdef.is_coroutine or fdef.is_generator:
+                    create_generator_class_for_func(
+                        module.fullname, None, fdef, mapper, name_suffix=suffix
+                    )
 
         # Construct and configure builder objects (cyclic runtime dependency).
         visitor = IRBuilderVisitor()
@@ -99,9 +119,17 @@ def build_ir(
             builder.functions,
             builder.classes,
             builder.final_names,
+            builder.type_var_names,
         )
         result[module.fullname] = module_ir
         class_irs.extend(builder.classes)
+
+    # Generator helper calls are fresh C activations after every suspension.
+    # Move values that must outlive one activation to the private frame before
+    # attribute-definedness and the remaining IR transforms run.
+    for class_ir in class_irs:
+        if class_ir.env_user_function is not None:
+            promote_generator_registers(class_ir.env_user_function, class_ir)
 
     analyze_always_defined_attrs(class_irs)
 
@@ -133,7 +161,7 @@ def transform_mypy_file(builder: IRBuilder, mypyfile: MypyFile) -> None:
     builder.enter("<module>")
 
     # Make sure we have a builtins import
-    builder.gen_import("builtins", -1)
+    builder.gen_import("builtins", 1)
 
     # Generate ops.
     for node in mypyfile.defs:

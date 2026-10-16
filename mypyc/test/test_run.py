@@ -11,18 +11,24 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
+
+import pytest
 
 from mypy import build
 from mypy.errors import CompileError
 from mypy.options import Options
-from mypy.test.config import test_temp_dir
+from mypy.test.config import mypyc_output_dir, test_temp_dir
 from mypy.test.data import DataDrivenTestCase
 from mypy.test.helpers import assert_module_equivalence, perform_file_operations
 from mypyc.build import construct_groups
 from mypyc.codegen import emitmodule
+from mypyc.codegen.emitmodule import collect_source_dependencies
 from mypyc.errors import Errors
 from mypyc.options import CompilerOptions
+from mypyc.test.config import test_data_prefix
+from mypyc.test.librt_cache import get_librt_path
 from mypyc.test.test_serialization import check_serialization_roundtrip
 from mypyc.test.testutil import (
     ICODE_GEN_BUILTINS,
@@ -30,6 +36,7 @@ from mypyc.test.testutil import (
     MypycDataSuite,
     assert_test_output,
     fudge_dir_mtimes,
+    has_test_name_tag,
     show_c,
     use_custom_builtins,
 )
@@ -59,18 +66,36 @@ files = [
     "run-classes.test",
     "run-traits.test",
     "run-generators.test",
+    "run-generics.test",
     "run-multimodule.test",
     "run-bench.test",
     "run-mypy-sim.test",
     "run-dunders.test",
+    "run-dunders-special.test",
     "run-singledispatch.test",
     "run-attrs.test",
+    "run-signatures.test",
+    "run-weakref.test",
     "run-python37.test",
     "run-python38.test",
+    "run-librt-strings.test",
+    "run-base64.test",
+    "run-librt-time.test",
+    "run-librt-random.test",
+    "run-threading.test",
+    "run-match.test",
+    "run-vecs-i64-interp.test",
+    "run-vecs-misc-interp.test",
+    "run-vecs-t-interp.test",
+    "run-vecs-nested-interp.test",
+    "run-vecs-i64.test",
+    "run-vecs-misc.test",
+    "run-vecs-t.test",
+    "run-vecs-nested.test",
 ]
 
-if sys.version_info >= (3, 10):
-    files.append("run-match.test")
+if sys.version_info >= (3, 12):
+    files.append("run-python312.test")
 
 setup_format = """\
 from setuptools import setup
@@ -78,7 +103,8 @@ from mypyc.build import mypycify
 
 setup(name='test_run_output',
       ext_modules=mypycify({}, separate={}, skip_cgen_input={!r}, strip_asserts=False,
-                           multi_file={}, opt_level='{}'),
+                           multi_file={}, opt_level='{}', install_librt={},
+                           experimental_features={}, depends_on_librt_internal={}),
 )
 """
 
@@ -138,14 +164,18 @@ class TestRun(MypycDataSuite):
     optional_out = True
     multi_file = False
     separate = False  # If True, using separate (incremental) compilation
+    strict_dunder_typing = False
 
     def run_case(self, testcase: DataDrivenTestCase) -> None:
-        # setup.py wants to be run from the root directory of the package, which we accommodate
-        # by chdiring into tmp/
-        with use_custom_builtins(
-            os.path.join(self.data_prefix, ICODE_GEN_BUILTINS), testcase
-        ), chdir_manager("tmp"):
-            self.run_case_inner(testcase)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.delenv("CFLAGS", raising=False)
+            # setup.py wants to be run from the root directory of the package, which we accommodate
+            # by chdiring into tmp/
+            with (
+                use_custom_builtins(os.path.join(self.data_prefix, ICODE_GEN_BUILTINS), testcase),
+                chdir_manager("tmp"),
+            ):
+                self.run_case_inner(testcase)
 
     def run_case_inner(self, testcase: DataDrivenTestCase) -> None:
         if not os.path.isdir(WORKDIR):  # (one test puts something in build...)
@@ -183,21 +213,32 @@ class TestRun(MypycDataSuite):
             self.run_case_step(testcase, step)
 
     def run_case_step(self, testcase: DataDrivenTestCase, incremental_step: int) -> None:
-        bench = testcase.config.getoption("--bench", False) and "Benchmark" in testcase.name
+        benchmark_build = has_test_name_tag(testcase.name, "benchmark")
+        bench = testcase.config.getoption("--bench", False) and (
+            benchmark_build or "Benchmark" in testcase.name
+        )
 
         options = Options()
         options.use_builtins_fixtures = True
         options.show_traceback = True
         options.strict_optional = True
+        options.strict_bytes = True
+        options.disable_bytearray_promotion = True
+        options.disable_memoryview_promotion = True
         options.python_version = sys.version_info[:2]
         options.export_types = True
         options.preserve_asts = True
         options.allow_empty_bodies = True
         options.incremental = self.separate
+        options.check_untyped_defs = True
 
         # Avoid checking modules/packages named 'unchecked', to provide a way
         # to test interacting with code we don't have types for.
         options.per_module_options["unchecked.*"] = {"follow_imports": "error"}
+        # Avoid checking modules/packages named 'skipped', to provide a way
+        # to test interacting with code ignored by follow_imports=skip.
+        options.per_module_options["skipped"] = {"follow_imports": "skip"}
+        options.per_module_options["skipped.*"] = {"follow_imports": "skip"}
 
         source = build.BuildSource("native.py", "native", None)
         sources = [source]
@@ -217,6 +258,14 @@ class TestRun(MypycDataSuite):
                 module_paths.append(fn)
 
                 shutil.copyfile(fn, os.path.join(os.path.dirname(fn), name + "_interpreted.py"))
+            elif fn.endswith("__init__.py"):
+                pkg_dir = os.path.dirname(fn)
+                if os.path.basename(pkg_dir).startswith("other"):
+                    name = pkg_dir.replace(os.sep, ".")
+                    module_names.append(name)
+                    sources.append(build.BuildSource(fn, name, None))
+                    to_delete.append(fn)
+                    module_paths.append(fn)
 
         for source in sources:
             options.per_module_options.setdefault(source.module, {})["mypyc"] = True
@@ -227,10 +276,24 @@ class TestRun(MypycDataSuite):
             else False
         )
 
-        groups = construct_groups(sources, separate, len(module_names) > 1)
+        groups = construct_groups(sources, separate, len(module_names) > 1, None)
 
+        # Use _librt_internal to test mypy-specific parts of librt (they have
+        # some special-casing in mypyc), for everything else use _librt suffix.
+        librt_internal = has_test_name_tag(testcase.name, "librt_internal")
+        librt = has_test_name_tag(testcase.name, "librt")
+        # Enable experimental features (local librt build also includes experimental features)
+        experimental_features = has_test_name_tag(testcase.name, "experimental")
+        result = None
         try:
-            compiler_options = CompilerOptions(multi_file=self.multi_file, separate=self.separate)
+            compiler_options = CompilerOptions(
+                multi_file=self.multi_file,
+                separate=self.separate,
+                strict_dunder_typing=self.strict_dunder_typing,
+                depends_on_librt_internal=librt_internal,
+                experimental_features=experimental_features,
+                strict_traceback_checks=True,
+            )
             result = emitmodule.parse_and_typecheck(
                 sources=sources,
                 options=options,
@@ -239,8 +302,15 @@ class TestRun(MypycDataSuite):
                 alt_lib_path=".",
             )
             errors = Errors(options)
-            ir, cfiles = emitmodule.compile_modules_to_c(
+            ir, cfiles, _ = emitmodule.compile_modules_to_c(
                 result, compiler_options=compiler_options, errors=errors, groups=groups
+            )
+            deps = sorted(
+                (
+                    (dep.path, dep.include_dirs, dep.internal)
+                    for dep in collect_source_dependencies(ir)
+                ),
+                key=lambda tup: tup[0],
             )
             if errors.num_errors:
                 errors.flush_errors()
@@ -249,27 +319,43 @@ class TestRun(MypycDataSuite):
             for line in e.messages:
                 print(fix_native_line_number(line, testcase.file, testcase.line))
             assert False, "Compile error"
+        finally:
+            if result is not None:
+                result.manager.metastore.close()
 
         # Check that serialization works on this IR. (Only on the first
         # step because the returned ir only includes updated code.)
         if incremental_step == 1:
             check_serialization_roundtrip(ir)
 
-        opt_level = int(os.environ.get("MYPYC_OPT_LEVEL", 0))
-        debug_level = int(os.environ.get("MYPYC_DEBUG_LEVEL", 0))
+        opt_level = 3 if benchmark_build else int(os.environ.get("MYPYC_OPT_LEVEL", 0))
 
         setup_file = os.path.abspath(os.path.join(WORKDIR, "setup.py"))
         # We pass the C file information to the build script via setup.py unfortunately
+        # Note: install_librt is always False since we use cached librt from librt_cache
         with open(setup_file, "w", encoding="utf-8") as f:
             f.write(
                 setup_format.format(
-                    module_paths, separate, cfiles, self.multi_file, opt_level, debug_level
+                    module_paths,
+                    separate,
+                    (cfiles, deps),
+                    self.multi_file,
+                    opt_level,
+                    False,  # install_librt - use cached version instead
+                    experimental_features,
+                    librt_internal,
                 )
             )
+
+        if librt:
+            # Use cached pre-built librt instead of rebuilding for each test
+            cached_librt = get_librt_path(experimental_features, opt_level=str(opt_level))
+            shutil.copytree(os.path.join(cached_librt, "librt"), "librt")
 
         if not run_setup(setup_file, ["build_ext", "--inplace"]):
             if testcase.config.getoption("--mypyc-showc"):
                 show_c(cfiles)
+            copy_output_files(mypyc_output_dir)
             assert False, "Compilation failed"
 
         # Assert that an output file got created
@@ -281,9 +367,7 @@ class TestRun(MypycDataSuite):
             # No driver.py provided by test case. Use the default one
             # (mypyc/test-data/driver/driver.py) that calls each
             # function named test_*.
-            default_driver = os.path.join(
-                os.path.dirname(__file__), "..", "test-data", "driver", "driver.py"
-            )
+            default_driver = os.path.join(test_data_prefix, "driver", "driver.py")
             shutil.copy(default_driver, driver_path)
         env = os.environ.copy()
         env["MYPYC_RUN_BENCH"] = "1" if bench else "0"
@@ -312,13 +396,30 @@ class TestRun(MypycDataSuite):
             # TODO: testDecorators1 hangs on 3.12, remove this once fixed
             proc.wait(timeout=30)
         output = proc.communicate()[0].decode("utf8")
+        output = output.replace(f'  File "{os.getcwd()}{os.sep}', '  File "')
         outlines = output.splitlines()
 
         if testcase.config.getoption("--mypyc-showc"):
             show_c(cfiles)
         if proc.returncode != 0:
             print()
-            print("*** Exit status: %d" % proc.returncode)
+            signal = proc.returncode == -11
+            extra = ""
+            if signal:
+                extra = " (likely segmentation fault)"
+            print(f"*** Exit status: {proc.returncode}{extra}")
+            if signal and not sys.platform.startswith("win"):
+                print()
+                if sys.platform == "darwin":
+                    debugger = "lldb"
+                else:
+                    debugger = "gdb"
+                print(
+                    f'hint: Use "pytest -n0 -s --mypyc-debug={debugger} -k <name-substring>" to run test in debugger'
+                )
+                print("hint: You may need to build a debug version of Python first and use it")
+                print('hint: See also "Debugging Segfaults" in mypyc/doc/dev-intro.md')
+            copy_output_files(mypyc_output_dir)
 
         # Verify output.
         if bench:
@@ -399,6 +500,14 @@ class TestRunSeparate(TestRun):
     files = ["run-multimodule.test", "run-mypy-sim.test"]
 
 
+class TestRunStrictDunderTyping(TestRun):
+    """Run the tests with strict dunder typing."""
+
+    strict_dunder_typing = True
+    test_name_suffix = "_dunder_typing"
+    files = ["run-dunders.test", "run-floats.test"]
+
+
 def fix_native_line_number(message: str, fnam: str, delta: int) -> str:
     """Update code locations in test case output to point to the .test file.
 
@@ -424,3 +533,17 @@ def fix_native_line_number(message: str, fnam: str, delta: int) -> str:
         message,
     )
     return message
+
+
+def copy_output_files(target_dir: str) -> None:
+    try:
+        os.mkdir(target_dir)
+    except OSError:
+        # Only copy data for the first failure, to avoid excessive output in case
+        # many tests fail
+        return
+
+    for fnam in glob.glob("build/*.[ch]"):
+        shutil.copy(fnam, target_dir)
+
+    sys.stderr.write(f"\nGenerated files: {target_dir} (for first failure only)\n\n")

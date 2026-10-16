@@ -47,9 +47,11 @@ PyObject *CPyNumber_InPlacePower(PyObject *base, PyObject *index)
 }
 
 PyObject *CPyObject_GetSlice(PyObject *obj, CPyTagged start, CPyTagged end) {
-    PyObject *start_obj = CPyTagged_AsObject(start);
-    PyObject *end_obj = CPyTagged_AsObject(end);
+    PyObject *start_obj = start == CPY_INT_TAG ? Py_NewRef(Py_None) : CPyTagged_AsObject(start);
+    PyObject *end_obj = end == CPY_INT_TAG ? Py_NewRef(Py_None) : CPyTagged_AsObject(end);
     if (unlikely(start_obj == NULL || end_obj == NULL)) {
+        Py_XDECREF(start_obj);
+        Py_XDECREF(end_obj);
         return NULL;
     }
     PyObject *slice = PySlice_New(start_obj, end_obj, NULL);
@@ -61,4 +63,24 @@ PyObject *CPyObject_GetSlice(PyObject *obj, CPyTagged start, CPyTagged end) {
     PyObject *result = PyObject_GetItem(obj, slice);
     Py_DECREF(slice);
     return result;
+}
+
+typedef PyObject *(*SetupFunction)(PyObject *);
+
+PyObject *CPy_SetupObject(PyObject *type) {
+    PyTypeObject *tp = (PyTypeObject *)type;
+    PyMethodDef *def = NULL;
+    for(; tp; tp = tp->tp_base) {
+        def = tp->tp_methods;
+        if (!def || !def->ml_name) {
+            continue;
+        }
+
+        if (!strcmp(def->ml_name, "__internal_mypyc_setup")) {
+            return ((SetupFunction)(void(*)(void))def->ml_meth)(type);
+        }
+    }
+
+    PyErr_SetString(PyExc_RuntimeError, "Internal mypyc error: Unable to find object setup function");
+    return NULL;
 }

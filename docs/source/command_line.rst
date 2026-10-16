@@ -68,10 +68,11 @@ for full details, see :ref:`running-mypy`.
     checked. For instance, ``mypy --exclude '/setup.py$'
     but_still_check/setup.py``.
 
-    In particular, ``--exclude`` does not affect mypy's :ref:`import following
-    <follow-imports>`. You can use a per-module :confval:`follow_imports` config
-    option to additionally avoid mypy from following imports and checking code
-    you do not wish to be checked.
+    In particular, ``--exclude`` does not affect mypy's discovery of files
+    via :ref:`import following <follow-imports>`. You can use a per-module
+    :confval:`ignore_errors` config option to silence errors from a given module,
+    or a per-module :confval:`follow_imports` config option to additionally avoid
+    mypy from following imports and checking code you do not wish to be checked.
 
     Note that mypy will never recursively discover files and directories named
     "site-packages", "node_modules" or "__pycache__", or those whose name starts
@@ -79,6 +80,10 @@ for full details, see :ref:`running-mypy`.
     '/(site-packages|node_modules|__pycache__|\..*)/$'`` would. Mypy will also
     never recursively discover files with extensions other than ``.py`` or
     ``.pyi``.
+
+.. option:: --exclude-gitignore
+
+    This flag will add everything that matches ``.gitignore`` file(s) to :option:`--exclude`.
 
 
 Optional arguments
@@ -95,6 +100,10 @@ Optional arguments
 .. option:: -V, --version
 
     Show program's version number and exit.
+
+.. option:: -O FORMAT, --output FORMAT {json}
+
+    Set a custom output format.
 
 .. _config-file-flag:
 
@@ -118,7 +127,6 @@ Config file
 
     This flag makes mypy warn about unused ``[mypy-<pattern>]`` config
     file sections.
-    (This requires turning off incremental mode using :option:`--no-incremental`.)
 
 
 .. _import-discovery:
@@ -161,6 +169,17 @@ imports.
         from package.mod import NonExisting  # Error: Module has no attribute 'NonExisting'
 
     For more details, see :ref:`ignore-missing-imports`.
+
+.. option:: --follow-untyped-imports
+
+    This flag makes mypy analyze imports from installed packages even if
+    missing a :ref:`py.typed marker or stubs <installed-packages>`.
+
+    .. warning::
+
+        Note that analyzing all unannotated modules might result in issues
+        when analyzing code not designed to be type checked and may significantly
+        increase how long mypy takes to run.
 
 .. option:: --follow-imports {normal,silent,skip,error}
 
@@ -352,7 +371,7 @@ definitions or calls.
 
 .. option:: --untyped-calls-exclude
 
-    This flag allows to selectively disable :option:`--disallow-untyped-calls`
+    This flag allows one to selectively disable :option:`--disallow-untyped-calls`
     for functions and methods defined in specific packages, modules, or classes.
     Note that each exclude entry acts as a prefix. For example (assuming there
     are no type annotations for ``third_party_lib`` available):
@@ -420,11 +439,11 @@ The following flags adjust how mypy handles values of type ``None``.
 
 .. option:: --implicit-optional
 
-    This flag causes mypy to treat arguments with a ``None``
-    default value as having an implicit :py:data:`~typing.Optional` type.
+    This flag causes mypy to treat parameters with a ``None``
+    default value as having an implicit optional type (``T | None``).
 
     For example, if this flag is set, mypy would assume that the ``x``
-    parameter is actually of type ``Optional[int]`` in the code snippet below
+    parameter is actually of type ``int | None`` in the code snippet below,
     since the default parameter is ``None``:
 
     .. code-block:: python
@@ -438,7 +457,7 @@ The following flags adjust how mypy handles values of type ``None``.
 
 .. option:: --no-strict-optional
 
-    This flag effectively disables checking of :py:data:`~typing.Optional`
+    This flag effectively disables checking of optional
     types and ``None`` values. With this option, mypy doesn't
     generally check the use of ``None`` values -- it is treated
     as compatible with every type.
@@ -517,22 +536,50 @@ potentially problematic or redundant in some way.
                 print(x + "bad")
 
     To help prevent mypy from generating spurious warnings, the "Statement is
-    unreachable" warning will be silenced in exactly two cases:
+    unreachable" warning will be silenced in exactly three cases:
 
     1.  When the unreachable statement is a ``raise`` statement, is an
         ``assert False`` statement, or calls a function that has the :py:data:`~typing.NoReturn`
         return type hint. In other words, when the unreachable statement
         throws an error or terminates the program in some way.
-    2.  When the unreachable statement was *intentionally* marked as unreachable
+    2.  When the unreachable statement is ``return NotImplemented``. This
+        is allowed by mypy due to its use in operator overloading.
+    3.  When the unreachable statement was *intentionally* marked as unreachable
         using :ref:`version_and_platform_checks`.
 
     .. note::
 
         Mypy currently cannot detect and report unreachable or redundant code
-        inside any functions using :ref:`type-variable-value-restriction`.
+        inside any functions using :ref:`value-constrained type variables <value-constrained-type-variables>`.
 
         This limitation will be removed in future releases of mypy.
 
+.. option:: --report-deprecated-as-note
+
+    If error code ``deprecated`` is enabled, mypy emits errors if your code
+    imports or uses deprecated features. This flag converts such errors to
+    notes, causing mypy to eventually finish with a zero exit code. Features
+    are considered deprecated when decorated with ``warnings.deprecated``.
+
+.. option:: --deprecated-calls-exclude
+
+    This flag allows one to selectively disable :ref:`deprecated<code-deprecated>` warnings
+    for functions and methods defined in specific packages, modules, or classes.
+    Note that each exclude entry acts as a prefix. For example (assuming ``foo.A.func`` is deprecated):
+
+    .. code-block:: python
+
+        # mypy --enable-error-code deprecated
+        #      --deprecated-calls-exclude=foo.A
+        import foo
+
+        foo.A().func()  # OK, the deprecated warning is ignored
+
+        # file foo.py
+        from typing_extensions import deprecated
+        class A:
+            @deprecated("Use A.func2 instead")
+            def func(self): pass
 
 .. _miscellaneous-strictness-flags:
 
@@ -550,9 +597,70 @@ of the above sections.
 .. option:: --allow-redefinition
 
     By default, mypy won't allow a variable to be redefined with an
-    unrelated type. This flag enables redefinition of a variable with an
+    unrelated type. This flag enables the redefinition of *unannotated*
+    variables with an arbitrary type. This also requires
+    :option:`--local-partial-types <mypy --no-local-partial-types>`, which is
+    enabled by default starting from mypy 2.0. Example:
+
+    .. code-block:: python
+
+        def maybe_convert(n: int, b: bool) -> int | str:
+            if b:
+                x = str(n)  # Assign "str"
+            else:
+                x = n       # Assign "int"
+            # Type of "x" is "int | str" here.
+            return x
+
+    Without this flag, mypy only supports inferring optional types
+    (``X | None``) from multiple assignments. With this option enabled,
+    mypy can infer arbitrary union types.
+
+    This also enables an unannotated variable to have different types in different
+    code locations:
+
+    .. code-block:: python
+
+        if check():
+            for x in range(n):
+                # Type of "x" is "int" here.
+                ...
+        else:
+            for x in ['a', 'b']:
+                # Type of "x" is "str" here.
+                ...
+
+    Function arguments are special, changing their type within function body
+    is allowed even if they are annotated, but that annotation is used to infer
+    types of r.h.s. of all subsequent assignments. Such middle-ground semantics
+    provides good balance for majority of common use cases. For example:
+
+    .. code-block:: python
+
+        def process(values: list[float]) -> None:
+            if not values:
+                values = [0, 0, 0]
+            reveal_type(values)  # Revealed type is list[float]
+
+    Note: We are planning to turn this flag on by default in a future mypy
+    release.
+
+.. option:: --allow-redefinition-new
+
+    Deprecated alias for :option:`--allow-redefinition <mypy --allow-redefinition>`.
+
+.. option:: --allow-redefinition-old
+
+    This is an older, more limited variant of
+    :option:`--allow-redefinition <mypy --allow-redefinition>`.
+    This flag enables redefinition of a variable with an
     arbitrary type *in some contexts*: only redefinitions within the
     same block and nesting depth as the original definition are allowed.
+
+    We have no plans to remove this flag, but
+    :option:`--allow-redefinition <mypy --allow-redefinition>`
+    is recommended for new use cases.
+
     Example where this can be useful:
 
     .. code-block:: python
@@ -572,32 +680,26 @@ of the above sections.
            items = "100"  # valid, items now has type str
            items = int(items)  # valid, items now has type int
 
-.. option:: --local-partial-types
+.. option:: --no-local-partial-types
 
-    In mypy, the most common cases for partial types are variables initialized using ``None``,
-    but without explicit ``Optional`` annotations. By default, mypy won't check partial types
-    spanning module top level or class top level. This flag changes the behavior to only allow
-    partial types at local level, therefore it disallows inferring variable type for ``None``
-    from two assignments in different scopes. For example:
+    Disable local partial types to enable legacy type inference mode for
+    containers.
+
+    Local partial types prevent inferring a container type for a variable, when
+    the initial assignment happens at module top level or in a class body, and
+    the container item type is only set in a function. Example:
 
     .. code-block:: python
 
-        from typing import Optional
+        a = []  # Need type annotation unless using --no-local-partial-types
 
-        a = None  # Need type annotation here if using --local-partial-types
-        b: Optional[int] = None
+        def func() -> None:
+            a.append(1)
 
-        class Foo:
-            bar = None  # Need type annotation here if using --local-partial-types
-            baz: Optional[int] = None
+        reveal_type(a)  # "list[int]" if using --no-local-partial-types
 
-            def __init__(self) -> None:
-                self.bar = 1
-
-        reveal_type(Foo().bar)  # Union[int, None] without --local-partial-types
-
-    Note: this option is always implicitly enabled in mypy daemon and will become
-    enabled by default for mypy in a future release.
+    Local partial types are enabled by default starting from mypy 2.0. The
+    mypy daemon requires local partial types.
 
 .. option:: --no-implicit-reexport
 
@@ -630,24 +732,65 @@ of the above sections.
 
     .. code-block:: python
 
-       from typing import Text
-
        items: list[int]
        if 'some string' in items:  # Error: non-overlapping container check!
            ...
 
-       text: Text
+       text: str
        if text != b'other bytes':  # Error: non-overlapping equality check!
            ...
 
-       assert text is not None  # OK, check against None is allowed as a special case.
+       assert text is not None  # OK, check against None is allowed
+
+
+.. option:: --strict-equality-for-none
+
+    This flag extends :option:`--strict-equality <mypy --strict-equality>` for checks
+    against ``None``:
+
+    .. code-block:: python
+
+       text: str
+       assert text is not None  # Error: non-overlapping identity check!
+
+    Note that :option:`--strict-equality-for-none <mypy --strict-equality-for-none>`
+    only works in combination with :option:`--strict-equality <mypy --strict-equality>`.
+
+.. option:: --no-strict-bytes
+
+    Treat ``bytearray`` and ``memoryview`` as subtypes of ``bytes``. This is not true
+    at runtime and can lead to unexpected behavior. This was the default behavior prior
+    to mypy 2.0.
+
+    .. code-block:: python
+
+       def f(buf: bytes) -> None:
+           assert isinstance(buf, bytes)  # Raises runtime AssertionError with bytearray/memoryview
+           with open("binary_file", "wb") as fp:
+               fp.write(buf)
+
+       # Using --no-strict-bytes disables the following errors
+       f(bytearray(b""))  # Argument 1 to "f" has incompatible type "bytearray"; expected "bytes"
+       f(memoryview(b""))  # Argument 1 to "f" has incompatible type "memoryview"; expected "bytes"
+
+       # If `f` accepts any object that implements the buffer protocol,
+       # consider using Buffer instead:
+       from collections.abc import Buffer  # "from typing_extensions" in Python 3.11 and earlier
+
+       def f(buf: Buffer) -> None:
+           with open("binary_file", "wb") as fp:
+               fp.write(buf)
+
+       f(b"")  # Ok
+       f(bytearray(b""))  # Ok
+       f(memoryview(b""))  # Ok
+
 
 .. option:: --extra-checks
 
     This flag enables additional checks that are technically correct but may be
-    impractical in real code. In particular, it prohibits partial overlap in
-    ``TypedDict`` updates, and makes arguments prepended via ``Concatenate``
-    positional-only. For example:
+    impractical. In particular, it prohibits partial overlap in ``TypedDict`` updates,
+    and makes arguments prepended via ``Concatenate`` positional-only. For example:
 
     .. code-block:: python
 
@@ -670,13 +813,39 @@ of the above sections.
        bad: Bad = {"a": 0, "b": "no"}
        test(bad, bar)
 
+    In future more checks may be added to this flag if:
+
+    * The corresponding use cases are rare, thus not justifying a dedicated
+      strictness flag.
+
+    * The new check cannot be supported as an opt-in error code.
+
 .. option:: --strict
 
-    This flag mode enables all optional error checking flags.  You can see the
-    list of flags enabled by strict mode in the full :option:`mypy --help` output.
+    This flag mode enables a defined subset of optional error-checking flags.
+    This subset primarily includes checks for inadvertent type unsoundness (i.e
+    strict will catch type errors as long as intentional methods like type ignore
+    or casting were not used.)
+
+    Note: the :option:`--warn-unreachable` flag
+    is not automatically enabled by the strict flag.
+
+    The strict flag does not take precedence over other strict-related flags.
+    Directly specifying a flag of alternate behavior will override the
+    behavior of strict, regardless of the order in which they are passed.
+    You can see the list of flags enabled by strict mode in the full
+    :option:`mypy --help` output.
 
     Note: the exact list of flags enabled by running :option:`--strict` may change
     over time.
+
+    .. include:: strict_list.rst
+    ..
+        The above file is autogenerated and included during html generation.
+        (That's an include directive, and this is a comment.)
+        It would be fine to generate it at some other time instead,
+        theoretically, but we already had a convenient hook during html gen.
+
 
 .. option:: --disable-error-code
 
@@ -710,6 +879,7 @@ of the above sections.
         # --disable-error-code attr-defined --enable-error-code attr-defined
         x = 'a string'
         x.trim()  # error: "str" has no attribute "trim"  [attr-defined]
+
 
 .. _configuring-error-messages:
 
@@ -746,6 +916,17 @@ in error messages.
     (note that column offsets are 0-based)::
 
         main.py:12:9: error: Unsupported operand types for / ("int" and "str")
+
+.. option:: --show-error-code-links
+
+    This flag will also display a link to error code documentation, anchored to the error code reported by mypy.
+    The corresponding error code will be highlighted within the documentation page.
+    If we enable this flag, the error message now looks like this::
+
+        main.py:3: error: Unsupported operand types for - ("int" and "str")  [operator]
+        main.py:3: note: See 'https://mypy.rtfd.io/en/stable/_refs.html#code-operator' for more info
+
+
 
 .. option:: --show-error-end
 
@@ -791,17 +972,6 @@ in error messages.
     useful or they may be overly noisy. If ``N`` is negative, there is
     no limit. The default limit is -1.
 
-.. option:: --force-uppercase-builtins
-
-    Always use ``List`` instead of ``list`` in error messages,
-    even on Python 3.9+.
-
-.. option:: --force-union-syntax
-
-    Always use ``Union[]`` and ``Optional[]`` for union types
-    in error messages (instead of the ``|`` operator),
-    even on Python 3.10+.
-
 
 .. _incremental:
 
@@ -842,9 +1012,10 @@ beyond what incremental mode can offer, try running mypy in
     writing to the cache, use ``--cache-dir=/dev/null`` (UNIX)
     or ``--cache-dir=nul`` (Windows).
 
-.. option:: --sqlite-cache
+.. option:: --no-sqlite-cache
 
-    Use an `SQLite`_ database to store the cache.
+    Avoid using `SQLite`_ database to store the cache, instead write cache data
+    out to individual files.
 
 .. option:: --cache-fine-grained
 
@@ -858,6 +1029,47 @@ beyond what incremental mode can offer, try running mypy in
 .. option:: --skip-cache-mtime-checks
 
     Skip cache internal consistency checks based on mtime.
+
+
+.. _parallel:
+
+Parallel type-checking
+**********************
+
+By default, mypy checks all modules in the same Python process. This can be slow
+for large code bases. Mypy offers parallel type-checking mode using
+multiple worker processes. In parallel mode, modules that do not depend on each
+other are type-checked in parallel. :ref:`Incremental cache <incremental>` is
+used to manage most of the shared state. Parallel type-checking also requires
+:option:`--local-partial-types <mypy --no-local-partial-types>`, which is
+enabled by default starting from mypy 2.0.
+
+.. option:: -n VALUE, --num-workers VALUE
+
+    Use the specified amount of parallel worker processes (in addition to the
+    coordinator process) to perform type-checking. Specifying ``--num-workers 0``
+    (default) disables parallel checking. Specifying ``--num-workers auto``
+    selects the number based on the CPU resources available to mypy.
+
+    Automatic selection uses at most 8 workers because each worker adds roughly
+    10% memory overhead. This cap does not apply when an explicit value is specified.
+
+    This setting will override the ``MYPY_NUM_WORKERS`` environment
+    variable if it is set.
+
+Notes:
+
+* An import cycle is always processed as a whole by a worker process. Thus,
+  avoiding large import cycles in your code will *significantly* improve
+  type-checking speed.
+
+* Specifying a number of workers that is larger than the number of *physical*
+  CPU cores is not beneficial, since mypy is usually CPU bound. Best way to
+  tune the number of workers on a given machine is to start from 3-4 workers
+  and increase the number while you see a performance improvement.
+
+* Parallel mode requires the native parser, which is enabled by default since
+  mypy 2.4 (see :option:`--no-native-parser <mypy --no-native-parser>`).
 
 
 Advanced options
@@ -933,6 +1145,15 @@ in developing or debugging mypy internals.
     cause mypy to type check the contents of ``temp.py`` instead of  ``original.py``,
     but error messages will still reference ``original.py``.
 
+.. option:: --no-native-parser
+
+    This disables the fast Rust-based native parser that parses directly
+    to mypy AST, and uses the legacy parser based on the stdlib :py:mod:`ast`
+    module instead. The native parser is the default since mypy 2.4.
+
+    The legacy parser can only parse syntax supported by the Python version
+    used to run mypy. The legacy parser will be removed in a future mypy release.
+
 
 Report generation
 *****************
@@ -997,7 +1218,7 @@ format into the specified directory.
 Enabling incomplete/experimental features
 *****************************************
 
-.. option:: --enable-incomplete-feature {PreciseTupleTypes}
+.. option:: --enable-incomplete-feature {PreciseTupleTypes,InlineTypedDict}
 
     Some features may require several mypy releases to implement, for example
     due to their complexity, potential for backwards incompatibility, or
@@ -1044,6 +1265,15 @@ List of currently incomplete/experimental features:
          # Without PreciseTupleTypes: tuple[int, ...]
          # With PreciseTupleTypes: tuple[()] | tuple[int] | tuple[int, int]
 
+* ``InlineTypedDict``: this feature enables non-standard syntax for inline
+  :ref:`TypedDicts <typeddict>`, for example:
+
+  .. code-block:: python
+
+     def test_values() -> {"width": int, "description": str}:
+         return {"width": 42, "description": "test"}
+
+
 
 Miscellaneous
 *************
@@ -1085,11 +1315,17 @@ Miscellaneous
    stub packages were found, they are installed and then another run
    is performed.
 
-.. option:: --junit-xml JUNIT_XML
+.. option:: --junit-xml JUNIT_XML_OUTPUT_FILE
 
     Causes mypy to generate a JUnit XML test result document with
     type checking results. This can make it easier to integrate mypy
     with continuous integration (CI) tools.
+
+.. option:: --junit-format {global,per_file}
+
+    If --junit-xml is set, specifies format.
+    global (default): single test with all errors;
+    per_file: one test entry per file with failures.
 
 .. option:: --find-occurrences CLASS.MEMBER
 
